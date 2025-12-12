@@ -1,0 +1,1953 @@
+import os
+import pickle
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import warnings
+import collections
+from datetime import datetime
+from pathlib import Path
+from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+import imagehash
+from skimage.metrics import structural_similarity as ssim
+
+warnings.filterwarnings('ignore')
+
+# 添加APISR项目路径
+sys.path.append('.')
+from test_code.test_utils import load_grl, load_rrdb, load_dat, load_cunet
+
+
+class ModernButton(ttk.Button):
+    """现代化按钮样式"""
+
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.configure(style='Accent.TButton')
+
+
+class APISRVideoProcessor:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("APISR 视频超分辨率处理工具")
+        self.root.geometry("1200x800")
+
+        # 设置窗口图标（如果有的话）
+        try:
+            self.root.iconbitmap('icon.ico')
+        except:
+            pass
+
+        # 设置主题颜色
+        self.bg_color = "#f5f5f7"
+        self.sidebar_color = "#2c3e50"
+        self.accent_color = "#3498db"
+        self.success_color = "#27ae60"
+        self.warning_color = "#f39c12"
+        self.danger_color = "#e74c3c"
+
+        # 设置样式
+        self.setup_styles()
+
+        # 初始化变量
+        self.input_path = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.model_var = tk.StringVar(value="GRL")
+        self.scale_var = tk.StringVar(value="4")
+        self.segment_duration = tk.StringVar(value="20")
+        self.downsample_threshold = tk.StringVar(value="720")
+        self.float16_var = tk.BooleanVar(value=False)
+        self.crop_for_4x_var = tk.BooleanVar(value=True)
+        self.batch_size_var = tk.StringVar(value="1")
+        self.tile_size_var = tk.StringVar(value="128")
+        self.hash_threshold_var = tk.StringVar(value="3")
+        self.ssim_threshold_var = tk.StringVar(value="0.98")
+        self.enable_dup_detect_var = tk.BooleanVar(value=True)
+        self.use_ssim_var = tk.BooleanVar(value=True)
+        self.use_hash_var = tk.BooleanVar(value=True)
+        self.test_mode_var = tk.BooleanVar(value=False)
+        self.history_size_var = tk.StringVar(value="40")  # 新增：历史帧数量
+
+        # 模型信息
+        self.models = {
+            "GRL": {"scale": [4], "weight": "pretrained/4x_APISR_GRL_GAN_generator.pth"},
+            "DAT": {"scale": [4], "weight": "pretrained/4x_APISR_DAT_GAN_generator.pth"},
+            "RRDB": {"scale": [2, 4], "weight": {
+                "2": "pretrained/2x_APISR_RRDB_GAN_generator.pth",
+                "4": "pretrained/4x_APISR_RRDB_GAN_generator.pth"
+            }},
+            "CUNET": {"scale": [4], "weight": "pretrained/4x_APISR_CUNET_GAN_generator.pth"}
+        }
+
+        # 处理器状态
+        self.processing = False
+        self.paused = False
+        self.stopped = False
+        self.generator = None
+        self.weight_dtype = torch.float32
+
+        # 进度恢复相关
+        self.current_segment_index = 0
+        self.current_frame_in_segment = 0
+        self.total_segments = 0
+        self.segments = []
+        self.processed_segments = []
+        self.progress_data_file = None
+
+        # 重复帧检测相关
+        self.dup_frame_count = 0
+
+        # 新增：历史帧缓存系统
+        self.init_history_cache()
+
+        # 临时文件路径
+        self.temp_base_dir = None
+        self.current_segment_frames_dir = None
+        self.video_base_name = None
+
+        # 线程控制
+        self.processing_thread = None
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.processing_lock = threading.Lock()
+        self.last_save_time = 0
+        self.save_interval = 10
+
+        # 新增：暂停时的内存优化
+        self.pause_lock = threading.Lock()
+        self.pause_cv = threading.Condition(self.pause_lock)
+        self.should_sleep = False  # 用于控制暂停时是否让线程休眠
+
+        self.setup_ui()
+
+    def setup_styles(self):
+        """设置UI样式"""
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('TFrame', background=self.bg_color)
+        style.configure('TLabel', background=self.bg_color, font=('Segoe UI', 9))
+        style.configure('TButton', font=('Segoe UI', 9), padding=5)
+        style.configure('Accent.TButton', background=self.accent_color,
+                        foreground='white', font=('Segoe UI', 9, 'bold'))
+        style.configure('TProgressbar', thickness=15, background=self.accent_color)
+        style.configure('TLabelframe', background=self.bg_color, borderwidth=2)
+        style.configure('TLabelframe.Label', background=self.bg_color,
+                        font=('Segoe UI', 10, 'bold'))
+
+    def init_history_cache(self):
+        """初始化历史帧缓存"""
+        try:
+            history_size = int(self.history_size_var.get())
+        except:
+            history_size = 40
+
+        self.frame_history = collections.deque(maxlen=history_size)
+        self.frame_hash_history = collections.deque(maxlen=history_size)
+
+        if self.use_ssim_var.get():
+            self.frame_thumbnail_history = collections.deque(maxlen=history_size)
+        else:
+            self.frame_thumbnail_history = None
+
+        self.frame_sr_history = collections.deque(maxlen=history_size)
+        self.frame_idx_history = collections.deque(maxlen=history_size)
+
+    def setup_ui(self):
+        """设置UI布局"""
+        # 主容器
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        # 标题
+        title_frame = ttk.Frame(main_container)
+        title_frame.pack(fill=tk.X, pady=(0, 15))
+
+        title_label = tk.Label(title_frame, text="APISR 视频超分辨率处理工具",
+                               font=('Segoe UI', 20, 'bold'),
+                               foreground=self.sidebar_color,
+                               background=self.bg_color)
+        title_label.pack(side=tk.LEFT)
+
+        version_label = tk.Label(title_frame, text="v1.6",  # 更新版本号
+                                 font=('Segoe UI', 9),
+                                 foreground='#7f8c8d',
+                                 background=self.bg_color)
+        version_label.pack(side=tk.RIGHT)
+
+        # 主内容区域
+        content_frame = ttk.Frame(main_container)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧参数面板
+        left_frame = ttk.Frame(content_frame)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
+
+        # 右侧日志面板
+        right_frame = ttk.Frame(content_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # 设置面板
+        self.setup_left_panel(left_frame)
+        self.setup_right_panel(right_frame)
+
+        # 进度条区域
+        progress_frame = ttk.Frame(main_container)
+        progress_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # 进度信息
+        progress_info_frame = ttk.Frame(progress_frame)
+        progress_info_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.progress_info = ttk.Label(progress_info_frame, text="准备开始处理",
+                                       font=('Segoe UI', 10, 'bold'),
+                                       foreground=self.sidebar_color)
+        self.progress_info.pack(side=tk.LEFT, anchor=tk.W)
+
+        self.detailed_progress_info = ttk.Label(progress_info_frame, text="",
+                                                font=('Segoe UI', 9),
+                                                foreground='#7f8c8d')
+        self.detailed_progress_info.pack(side=tk.RIGHT, anchor=tk.E)
+
+        # 进度条
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress_frame, variable=self.progress_var,
+                                            maximum=100, length=600,
+                                            style='TProgressbar')
+        self.progress_bar.pack(fill=tk.X, pady=(0, 5))
+
+        # 控制按钮区域
+        control_frame = ttk.Frame(main_container)
+        control_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # 左侧按钮组
+        left_btn_frame = ttk.Frame(control_frame)
+        left_btn_frame.pack(side=tk.LEFT)
+
+        self.process_btn = ModernButton(left_btn_frame, text="▶ 开始处理",
+                                        command=self.start_processing, width=12)
+        self.process_btn.pack(side=tk.LEFT, padx=2)
+
+        self.pause_btn = ttk.Button(left_btn_frame, text="⏸ 暂停",
+                                    command=self.toggle_pause, width=12, state='disabled')
+        self.pause_btn.pack(side=tk.LEFT, padx=2)
+
+        self.stop_btn = ttk.Button(left_btn_frame, text="⏹ 停止",
+                                   command=self.stop_processing, width=12, state='disabled')
+        self.stop_btn.pack(side=tk.LEFT, padx=2)
+
+        # 中间统计信息
+        center_btn_frame = ttk.Frame(control_frame)
+        center_btn_frame.pack(side=tk.LEFT, padx=20)
+
+        self.dup_info = tk.Label(center_btn_frame, text="重复帧: 0",
+                                 font=('Segoe UI', 9),
+                                 foreground=self.warning_color,
+                                 background=self.bg_color)
+        self.dup_info.pack()
+
+        # 右侧按钮组
+        right_btn_frame = ttk.Frame(control_frame)
+        right_btn_frame.pack(side=tk.RIGHT)
+
+        ttk.Button(right_btn_frame, text="📂 打开目录",
+                   command=self.open_output_dir, width=12).pack(side=tk.RIGHT, padx=2)
+
+        ttk.Button(right_btn_frame, text="清理临时文件",
+                   command=self.cleanup_temp_files, width=12).pack(side=tk.RIGHT, padx=2)
+
+        ttk.Button(right_btn_frame, text="清空日志",
+                   command=self.clear_log, width=12).pack(side=tk.RIGHT, padx=2)
+
+        # 底部状态栏
+        status_bar = ttk.Frame(main_container, height=25)
+        status_bar.pack(fill=tk.X, pady=(10, 0))
+
+        self.status_label = tk.Label(status_bar, text="准备就绪",
+                                     font=('Segoe UI', 9),
+                                     foreground=self.success_color,
+                                     background=self.bg_color)
+        self.status_label.pack(side=tk.LEFT, padx=10)
+
+        gpu_info = self.get_gpu_info()
+        self.gpu_label = tk.Label(status_bar, text=gpu_info,
+                                  font=('Segoe UI', 9),
+                                  foreground='#7f8c8d',
+                                  background=self.bg_color)
+        self.gpu_label.pack(side=tk.RIGHT, padx=10)
+
+        # 配置初始模型
+        self.on_model_change()
+
+    def setup_left_panel(self, parent):
+        """设置左侧参数面板"""
+        # 创建主框架
+        main_frame = ttk.Frame(parent)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 使用网格布局，3行3列
+        for i in range(3):
+            main_frame.grid_rowconfigure(i, weight=1, pad=5)
+            main_frame.grid_columnconfigure(i, weight=1, pad=5)
+
+        row = 0
+        col = 0
+
+        # 1. 文件设置部分
+        file_frame = ttk.LabelFrame(main_frame, text="文件设置", padding=10)
+        file_frame.grid(row=row, column=col, sticky="nsew", padx=(0, 5), pady=(0, 5))
+
+        # 输入文件
+        ttk.Label(file_frame, text="输入视频:", font=('Segoe UI', 9)).pack(anchor=tk.W, pady=(0, 2))
+        input_frame = ttk.Frame(file_frame)
+        input_frame.pack(fill=tk.X, pady=(0, 8))
+        input_entry = ttk.Entry(input_frame, textvariable=self.input_path, font=('Segoe UI', 9))
+        input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(input_frame, text="浏览", command=self.select_input_file, width=6).pack(side=tk.RIGHT)
+
+        # 输出目录
+        ttk.Label(file_frame, text="输出目录:", font=('Segoe UI', 9)).pack(anchor=tk.W, pady=(0, 2))
+        output_frame = ttk.Frame(file_frame)
+        output_frame.pack(fill=tk.X)
+        output_entry = ttk.Entry(output_frame, textvariable=self.output_dir, font=('Segoe UI', 9))
+        output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(output_frame, text="浏览", command=self.select_output_dir, width=6).pack(side=tk.RIGHT)
+
+        col += 1
+
+        # 2. 模型参数部分
+        model_frame = ttk.LabelFrame(main_frame, text="模型参数", padding=10)
+        model_frame.grid(row=row, column=col, sticky="nsew", padx=5, pady=(0, 5))
+
+        # 模型选择
+        ttk.Label(model_frame, text="选择模型:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
+                                   values=list(self.models.keys()),
+                                   state="readonly", width=15, font=('Segoe UI', 9))
+        model_combo.grid(row=0, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        model_combo.bind('<<ComboboxSelected>>', self.on_model_change)
+
+        # 缩放因子
+        ttk.Label(model_frame, text="缩放因子:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.scale_combo = ttk.Combobox(model_frame, textvariable=self.scale_var,
+                                        state="readonly", width=15, font=('Segoe UI', 9))
+        self.scale_combo.grid(row=1, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+
+        # 分段时长
+        ttk.Label(model_frame, text="分段时长(秒):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(model_frame, textvariable=self.segment_duration,
+                  width=15, font=('Segoe UI', 9)).grid(row=2, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+
+        # 下采样阈值
+        ttk.Label(model_frame, text="下采样阈值:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(model_frame, textvariable=self.downsample_threshold,
+                  width=15, font=('Segoe UI', 9)).grid(row=3, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+
+        col += 1
+
+        # 3. 性能设置部分
+        perf_frame = ttk.LabelFrame(main_frame, text="性能设置", padding=10)
+        perf_frame.grid(row=row, column=col, sticky="nsew", padx=(5, 0), pady=(0, 5))
+
+        # 批处理大小
+        ttk.Label(perf_frame, text="批处理大小:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(perf_frame, textvariable=self.batch_size_var,
+                  width=12, font=('Segoe UI', 9)).grid(row=0, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+
+        # 瓦片大小
+        ttk.Label(perf_frame, text="瓦片大小:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Entry(perf_frame, textvariable=self.tile_size_var,
+                  width=12, font=('Segoe UI', 9)).grid(row=1, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+
+        row += 1
+        col = 0
+
+        # 4. 重复帧检测部分
+        dup_frame = ttk.LabelFrame(main_frame, text="重复帧检测设置", padding=10)
+        dup_frame.grid(row=row, column=col, columnspan=2, sticky="nsew", padx=(0, 5), pady=5)
+        dup_frame.grid_columnconfigure(1, weight=1)
+
+        # 启用检测
+        ttk.Checkbutton(dup_frame, text="启用重复帧检测",
+                        variable=self.enable_dup_detect_var).grid(row=0, column=0, sticky=tk.W, pady=2, columnspan=2)
+
+        # 检测方法
+        method_frame = ttk.Frame(dup_frame)
+        method_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Checkbutton(method_frame, text="哈希检测",
+                        variable=self.use_hash_var).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(method_frame, text="SSIM检测",
+                        variable=self.use_ssim_var).pack(side=tk.LEFT)
+
+        # 哈希阈值
+        ttk.Label(dup_frame, text="哈希阈值:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        hash_frame = ttk.Frame(dup_frame)
+        hash_frame.grid(row=2, column=1, sticky=tk.W, pady=2)
+        ttk.Entry(hash_frame, textvariable=self.hash_threshold_var,
+                  width=8, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(hash_frame, text="(0-10)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
+
+        # SSIM阈值
+        ttk.Label(dup_frame, text="SSIM阈值:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        ssim_frame = ttk.Frame(dup_frame)
+        ssim_frame.grid(row=3, column=1, sticky=tk.W, pady=2)
+        ttk.Entry(ssim_frame, textvariable=self.ssim_threshold_var,
+                  width=8, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(ssim_frame, text="(0.9-1.0)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
+
+        # 历史帧数量（新增）
+        ttk.Label(dup_frame, text="历史帧数量:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        history_frame = ttk.Frame(dup_frame)
+        history_frame.grid(row=4, column=1, sticky=tk.W, pady=2)
+        history_slider = ttk.Scale(history_frame, from_=5, to=100, orient=tk.HORIZONTAL,
+                                   variable=self.history_size_var, length=120)
+        history_slider.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(history_frame, textvariable=self.history_size_var, width=3).pack(side=tk.LEFT)
+
+        col = 2
+
+        # 5. 处理选项部分
+        options_frame = ttk.LabelFrame(main_frame, text="处理选项", padding=10)
+        options_frame.grid(row=row, column=col, sticky="nsew", padx=(5, 0), pady=5)
+
+        ttk.Checkbutton(options_frame, text="使用FP16推理",
+                        variable=self.float16_var).pack(anchor=tk.W, pady=2)
+
+        ttk.Checkbutton(options_frame, text="为4倍缩放裁剪边缘",
+                        variable=self.crop_for_4x_var).pack(anchor=tk.W, pady=2)
+
+        ttk.Checkbutton(options_frame, text="测试模式(仅重复帧检测)",
+                        variable=self.test_mode_var).pack(anchor=tk.W, pady=2)
+
+        row += 1
+
+        # 6. 说明信息部分
+        info_frame = ttk.LabelFrame(main_frame, text="说明", padding=10)
+        info_frame.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(5, 0))
+
+        info_text = """
+1. 暂停/继续：使用同一按钮切换，暂停时自动保存进度
+2. 停止：可选择是否保存进度，保存后可恢复
+3. 临时文件夹以视频文件名命名，便于管理
+4. 每个片段的帧文件在片段处理完成后自动清理
+5. 重复帧检测：哈希检测适合完全相同帧，SSIM检测适合结构相似帧
+6. 增强版：每帧会与最近N帧（可配置）进行对比，检测更准确
+"""
+
+        info_label = tk.Label(info_frame, text=info_text,
+                              font=('Segoe UI', 8),
+                              foreground='#7f8c8d',
+                              background=self.bg_color,
+                              justify=tk.LEFT)
+        info_label.pack(anchor=tk.W)
+
+    def setup_right_panel(self, parent):
+        """设置右侧日志面板"""
+        log_frame = ttk.LabelFrame(parent, text="处理日志", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = ScrolledText(log_frame, height=28, width=60,
+                                     font=('Consolas', 9),
+                                     bg='#2c3e50', fg='white',
+                                     insertbackground='white')
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def get_gpu_info(self):
+        """获取GPU信息"""
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+            return f"GPU: {gpu_name} ({gpu_memory:.1f}GB)"
+        return "无可用GPU"
+
+    def on_model_change(self, event=None):
+        """当模型改变时更新可用缩放因子"""
+        model = self.model_var.get()
+        if model in self.models:
+            scales = self.models[model]["scale"]
+            self.scale_combo['values'] = scales
+            if str(scales[0]) in self.scale_var.get():
+                self.scale_var.set(str(scales[0]))
+            else:
+                self.scale_var.set(str(scales[0]))
+
+    def select_input_file(self):
+        """选择输入视频文件"""
+        filename = filedialog.askopenfilename(
+            title="选择视频文件",
+            filetypes=[
+                ("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if filename:
+            self.input_path.set(filename)
+            # 设置视频基础名称
+            self.video_base_name = Path(filename).stem
+
+            # 自动设置输出目录
+            if not self.output_dir.get():
+                output_path = Path(filename).parent / "APISR_Output"
+                self.output_dir.set(str(output_path))
+
+            # 检查恢复进度
+            self.check_and_recover_progress()
+
+    def select_output_dir(self):
+        """选择输出目录"""
+        directory = filedialog.askdirectory(title="选择输出目录")
+        if directory:
+            self.output_dir.set(directory)
+            # 检查恢复进度
+            self.check_and_recover_progress()
+
+    def open_output_dir(self):
+        """打开输出目录"""
+        output_dir = self.output_dir.get()
+        if output_dir and os.path.exists(output_dir):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(output_dir)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", output_dir])
+                else:
+                    subprocess.Popen(["xdg-open", output_dir])
+            except Exception as e:
+                self.log(f"打开目录失败: {e}")
+
+    def check_and_recover_progress(self):
+        """检查并恢复未完成的任务"""
+        if not self.output_dir.get() or not self.input_path.get():
+            return
+
+        # 基于视频文件名生成临时文件夹名
+        video_name = Path(self.input_path.get()).stem
+        temp_dir_name = f"{video_name}_temp"
+        progress_file = os.path.join(self.output_dir.get(), temp_dir_name, "progress_data.pkl")
+
+        # 检查是否有进度文件
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'rb') as f:
+                    progress_data = pickle.load(f)
+
+                response = messagebox.askyesnocancel("发现未完成的任务",
+                                                     f"发现未完成的任务。是否恢复上次的任务？\n\n"
+                                                     f"输入文件: {progress_data.get('input_path', '未知')}\n"
+                                                     f"模型: {progress_data.get('model', '未知')}\n"
+                                                     f"缩放: {progress_data.get('scale', '未知')}x\n"
+                                                     f"进度: 片段 {progress_data.get('current_segment_index', 0) + 1}/{progress_data.get('total_segments', 0)} 的第 {progress_data.get('current_frame_in_segment', 0) + 1} 帧")
+
+                if response:
+                    # 恢复进度
+                    self.input_path.set(progress_data.get('input_path', ''))
+                    self.model_var.set(progress_data.get('model', 'GRL'))
+                    self.scale_var.set(str(progress_data.get('scale', 4)))
+                    self.downsample_threshold.set(str(progress_data.get('downsample_threshold', 720)))
+                    self.float16_var.set(progress_data.get('float16', False))
+                    self.crop_for_4x_var.set(progress_data.get('crop_for_4x', True))
+                    self.batch_size_var.set(str(progress_data.get('batch_size', 1)))
+                    self.hash_threshold_var.set(str(progress_data.get('hash_threshold', 3)))
+                    self.use_hash_var.set(progress_data.get('use_hash', True))
+                    self.use_ssim_var.set(progress_data.get('use_ssim', True))
+                    self.ssim_threshold_var.set(str(progress_data.get('ssim_threshold', 0.98)))
+                    self.test_mode_var.set(progress_data.get('test_mode', False))
+                    self.history_size_var.set(str(progress_data.get('history_size', 40)))
+
+                    self.current_segment_index = progress_data.get('current_segment_index', 0)
+                    self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
+                    self.total_segments = progress_data.get('total_segments', 0)
+                    self.segments = progress_data.get('segments', [])
+                    self.processed_segments = progress_data.get('processed_segments', [])
+                    self.temp_base_dir = progress_data.get('temp_base_dir')
+                    self.dup_frame_count = progress_data.get('dup_frame_count', 0)
+
+                    self.progress_data_file = progress_file
+                    self.log(
+                        f"已加载未完成的任务，当前进度：片段 {self.current_segment_index + 1}/{self.total_segments} 的第 {self.current_frame_in_segment + 1} 帧")
+                    self.update_dup_info(self.dup_frame_count)
+
+                    # 设置视频基础名称
+                    if self.input_path.get():
+                        self.video_base_name = Path(self.input_path.get()).stem
+
+                elif response is False:
+                    # 用户选择不恢复，删除进度文件
+                    self.cleanup_temp_files()
+                    self.log("已清理未完成的任务数据")
+            except Exception as e:
+                self.log(f"加载进度文件时出错: {e}")
+
+    def setup_temp_dirs(self):
+        """设置临时目录结构 - 基于视频文件名"""
+        output_dir = self.output_dir.get()
+        if not output_dir or not self.video_base_name:
+            return None
+
+        # 基于视频文件名创建临时目录
+        temp_dir_name = f"{self.video_base_name}_temp"
+        self.temp_base_dir = os.path.join(output_dir, temp_dir_name)
+
+        # 创建标准化的目录结构
+        dirs = {
+            'base': self.temp_base_dir,
+            'original_segments': os.path.join(self.temp_base_dir, "01_original_segments"),
+            'audio': os.path.join(self.temp_base_dir, "02_audio"),
+            'segment_frames': os.path.join(self.temp_base_dir, "03_segment_frames"),
+            'processed_segments': os.path.join(self.temp_base_dir, "04_processed_segments"),
+            'logs': os.path.join(self.temp_base_dir, "05_logs")
+        }
+
+        # 创建目录
+        for path in dirs.values():
+            os.makedirs(path, exist_ok=True)
+
+        return dirs
+
+    def setup_segment_frame_dirs(self, segment_index):
+        """为当前片段设置帧目录"""
+        if not self.temp_base_dir:
+            return None, None
+
+        # 创建标准化的帧目录结构
+        segment_dir_name = f"segment_{segment_index:03d}"
+        segment_path = os.path.join(self.temp_base_dir, "03_segment_frames", segment_dir_name)
+
+        before_dir = os.path.join(segment_path, "before_frames")
+        after_dir = os.path.join(segment_path, "after_frames")
+
+        os.makedirs(before_dir, exist_ok=True)
+        os.makedirs(after_dir, exist_ok=True)
+
+        return before_dir, after_dir
+
+    def cleanup_segment_frame_dirs(self, segment_index):
+        """清理当前片段的帧目录"""
+        if not self.temp_base_dir:
+            return
+
+        segment_dir_name = f"segment_{segment_index:03d}"
+        segment_path = os.path.join(self.temp_base_dir, "03_segment_frames", segment_dir_name)
+
+        if os.path.exists(segment_path):
+            try:
+                shutil.rmtree(segment_path)
+                self.log(f"已清理临时帧目录: segment_{segment_index:03d}")
+            except Exception as e:
+                self.log(f"清理临时帧目录时出错: {e}")
+
+    def cleanup_temp_files(self):
+        """清理临时文件"""
+        output_dir = self.output_dir.get()
+        if output_dir:
+            # 查找所有基于视频文件名的临时目录
+            temp_dirs = []
+            for item in os.listdir(output_dir):
+                item_path = os.path.join(output_dir, item)
+                if os.path.isdir(item_path) and item.endswith("_temp"):
+                    temp_dirs.append(item_path)
+
+            if temp_dirs:
+                response = messagebox.askyesno("清理临时文件",
+                                               f"找到 {len(temp_dirs)} 个临时目录。是否清理所有临时文件？")
+                if response:
+                    for temp_dir in temp_dirs:
+                        try:
+                            shutil.rmtree(temp_dir)
+                            self.log(f"已清理临时目录: {os.path.basename(temp_dir)}")
+                        except Exception as e:
+                            self.log(f"清理临时目录时出错: {e}")
+                    messagebox.showinfo("清理完成", "临时文件清理完成")
+            else:
+                messagebox.showinfo("清理临时文件", "没有找到临时文件")
+
+    def log(self, message):
+        """添加日志"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.log_text.see(tk.END)
+        self.root.update_idletasks()
+
+    def clear_log(self):
+        """清空日志"""
+        self.log_text.delete(1.0, tk.END)
+
+    def update_status(self, message, color="black"):
+        """更新状态"""
+        colors = {
+            "black": "#2c3e50",
+            "green": self.success_color,
+            "blue": self.accent_color,
+            "orange": self.warning_color,
+            "red": self.danger_color
+        }
+        self.status_label.config(text=message, foreground=colors.get(color, color))
+        self.root.update_idletasks()
+
+    def update_progress_info(self):
+        """更新进度信息"""
+        if self.total_segments > 0:
+            info = f"处理进度: 片段 {self.current_segment_index + 1}/{self.total_segments}"
+            self.progress_info.config(text=info)
+            self.root.update_idletasks()
+
+    def update_detailed_progress(self, current_frame, total_frames):
+        """更新详细进度信息"""
+        if total_frames > 0:
+            percentage = current_frame / total_frames * 100
+            info = f"当前片段: 第 {current_frame}/{total_frames} 帧 ({percentage:.1f}%)"
+            self.detailed_progress_info.config(text=info)
+            self.root.update_idletasks()
+
+    def update_dup_info(self, dup_count):
+        """更新重复帧信息"""
+        self.dup_info.config(text=f"重复帧: {dup_count}")
+        self.root.update_idletasks()
+
+    def update_progress(self, value):
+        """更新进度条"""
+        self.progress_var.set(value)
+        self.root.update_idletasks()
+
+    def save_progress(self, force=False):
+        """保存进度 - 优化保存频率"""
+        if not self.output_dir.get() or not self.temp_base_dir:
+            return
+
+        # 检查是否需要保存
+        current_time = time.time()
+        if not force and current_time - self.last_save_time < self.save_interval:
+            return
+
+        progress_data = {
+            'input_path': self.input_path.get(),
+            'model': self.model_var.get(),
+            'scale': int(self.scale_var.get()),
+            'downsample_threshold': int(self.downsample_threshold.get()),
+            'float16': self.float16_var.get(),
+            'crop_for_4x': self.crop_for_4x_var.get(),
+            'batch_size': int(self.batch_size_var.get()),
+            'hash_threshold': int(self.hash_threshold_var.get()),
+            'ssim_threshold': float(self.ssim_threshold_var.get()),
+            'use_hash': self.use_hash_var.get(),
+            'use_ssim': self.use_ssim_var.get(),
+            'test_mode': self.test_mode_var.get(),
+            'history_size': int(self.history_size_var.get()),
+            'current_segment_index': self.current_segment_index,
+            'current_frame_in_segment': self.current_frame_in_segment,
+            'total_segments': self.total_segments,
+            'segments': self.segments,
+            'processed_segments': self.processed_segments,
+            'temp_base_dir': self.temp_base_dir,
+            'dup_frame_count': self.dup_frame_count,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+        try:
+            with open(progress_file, 'wb') as f:
+                pickle.dump(progress_data, f)
+
+            self.last_save_time = current_time
+            if force:
+                self.log(
+                    f"进度已保存: 片段 {self.current_segment_index + 1} 的第 {self.current_frame_in_segment + 1} 帧")
+        except Exception as e:
+            self.log(f"保存进度时出错: {e}")
+
+    def calculate_frame_hash(self, frame):
+        """计算帧的感知哈希值（优化版）"""
+        # 先缩小图像以减少计算量
+        h, w = frame.shape[:2]
+        if h > 360 or w > 480:
+            new_h = 360
+            new_w = int(w * (360 / h))
+            frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            frame_resized = frame
+
+        frame_rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
+
+        # 使用更高效的哈希方法
+        frame_hash = imagehash.phash(pil_img, hash_size=8)  # 减小哈希大小以提高计算速度
+
+        return frame_hash
+
+    def calculate_ssim_fast(self, frame1, frame2):
+        """快速计算SSIM（优化版）"""
+        # 将图像缩小以加速计算
+        h1, w1 = frame1.shape[:2]
+        h2, w2 = frame2.shape[:2]
+
+        # 使用较小的固定尺寸
+        target_size = (180, 320)  # 16:9的比例
+
+        # 如果图像比目标尺寸大，则缩小
+        if h1 > target_size[0] or w1 > target_size[1]:
+            scale_factor = min(target_size[0] / h1, target_size[1] / w1)
+            new_h = int(h1 * scale_factor)
+            new_w = int(w1 * scale_factor)
+            gray1 = cv2.resize(cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY), (new_w, new_h))
+        else:
+            gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+
+        if h2 > target_size[0] or w2 > target_size[1]:
+            scale_factor = min(target_size[0] / h2, target_size[1] / w2)
+            new_h = int(h2 * scale_factor)
+            new_w = int(w2 * scale_factor)
+            gray2 = cv2.resize(cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY), (new_w, new_h))
+        else:
+            gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+
+        try:
+            ssim_value, _ = ssim(gray1, gray2, full=True, data_range=255)
+            return ssim_value
+        except:
+            return 0.0
+
+    def check_frame_duplicate_enhanced(self, frame, frame_idx):
+        """增强版重复帧检测，检查最近N帧"""
+        if not self.enable_dup_detect_var.get() or not self.frame_history:
+            return False, None, None, None
+
+        current_hash = None
+        current_thumbnail = None
+
+        # 计算当前帧的信息（按需计算）
+        if self.use_hash_var.get():
+            current_hash = self.calculate_frame_hash(frame)
+
+        if self.use_ssim_var.get():
+            # 保存缩略图用于SSIM计算
+            h, w = frame.shape[:2]
+            if h > 180 or w > 320:
+                new_h = 180
+                new_w = int(w * (180 / h))
+                current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                current_thumbnail = frame.copy()
+
+        # 获取阈值
+        hash_threshold = int(self.hash_threshold_var.get())
+        ssim_threshold = float(self.ssim_threshold_var.get())
+
+        # 从最近帧开始检查（时间上越接近越可能重复）
+        best_match_idx = -1
+        best_match_reason = ""
+
+        # 遍历历史帧（从最近的开始）
+        for i, (hist_frame, hist_hash, hist_thumbnail, hist_sr_result, hist_frame_idx) in enumerate(
+                zip(self.frame_history, self.frame_hash_history,
+                    self.frame_thumbnail_history if self.use_ssim_var.get() else [None] * len(self.frame_history),
+                    self.frame_sr_history,
+                    self.frame_idx_history)):
+
+            # 跳过无效记录
+            if hist_frame is None or hist_sr_result is None:
+                continue
+
+            # 如果使用哈希检测
+            if self.use_hash_var.get() and current_hash is not None and hist_hash is not None:
+                hash_diff = current_hash - hist_hash
+                if hash_diff <= hash_threshold:
+                    # 如果同时启用了SSIM检测，需要验证SSIM
+                    if self.use_ssim_var.get():
+                        ssim_value = self.calculate_ssim_fast(frame, hist_frame)
+                        if ssim_value >= ssim_threshold:
+                            best_match_idx = i
+                            best_match_reason = f"哈希({hash_diff})和SSIM({ssim_value:.3f})匹配"
+                            break
+                    else:
+                        # 只使用哈希检测
+                        best_match_idx = i
+                        best_match_reason = f"哈希匹配(差异:{hash_diff})"
+                        break
+            # 如果只使用SSIM检测
+            elif self.use_ssim_var.get() and current_thumbnail is not None and hist_thumbnail is not None:
+                ssim_value = self.calculate_ssim_fast(frame, hist_frame)
+                if ssim_value >= ssim_threshold:
+                    best_match_idx = i
+                    best_match_reason = f"SSIM匹配({ssim_value:.3f})"
+                    break
+
+        if best_match_idx >= 0:
+            # 找到匹配的帧
+            matched_sr_result = self.frame_sr_history[best_match_idx]
+            self.dup_frame_count += 1
+            self.update_dup_info(self.dup_frame_count)
+
+            # 记录匹配信息
+            matched_frame_idx = self.frame_idx_history[best_match_idx]
+            self.log(f"帧 {frame_idx} 与帧 {matched_frame_idx} 重复: {best_match_reason}")
+
+            # 更新历史帧信息（将匹配帧移到最近位置）
+            if best_match_idx > 0:  # 如果不是已经在最前面
+                # 重新排列历史记录，将匹配帧移到最近位置
+                items_to_move = [
+                    self.frame_history[best_match_idx],
+                    self.frame_hash_history[best_match_idx],
+                    self.frame_thumbnail_history[best_match_idx] if self.use_ssim_var.get() else None,
+                    self.frame_sr_history[best_match_idx],
+                    self.frame_idx_history[best_match_idx]
+                ]
+
+                # 移除匹配帧
+                del self.frame_history[best_match_idx]
+                del self.frame_hash_history[best_match_idx]
+                if self.use_ssim_var.get():
+                    del self.frame_thumbnail_history[best_match_idx]
+                del self.frame_sr_history[best_match_idx]
+                del self.frame_idx_history[best_match_idx]
+
+                # 插入到最前面（最近位置）
+                self.frame_history.appendleft(items_to_move[0])
+                self.frame_hash_history.appendleft(items_to_move[1])
+                if self.use_ssim_var.get():
+                    self.frame_thumbnail_history.appendleft(items_to_move[2])
+                self.frame_sr_history.appendleft(items_to_move[3])
+                self.frame_idx_history.appendleft(items_to_move[4])
+
+            return True, matched_sr_result.copy(), current_hash, current_thumbnail
+
+        return False, None, current_hash, current_thumbnail
+
+    def add_frame_to_history(self, frame, frame_hash, frame_thumbnail, sr_result, frame_idx):
+        """添加帧到历史记录"""
+        # 添加帧数据
+        self.frame_history.append(frame.copy())
+        self.frame_hash_history.append(frame_hash)
+        if self.use_ssim_var.get():
+            self.frame_thumbnail_history.append(frame_thumbnail)
+
+        self.frame_sr_history.append(sr_result.copy() if sr_result is not None else None)
+        self.frame_idx_history.append(frame_idx)
+
+    def extract_audio(self, video_path, audio_path):
+        """提取音频"""
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-vn',
+            '-acodec', 'copy',
+            '-loglevel', 'quiet',
+            audio_path
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log(f"提取音频失败: {e.stderr}")
+            return False
+
+    def split_video_by_keyframes(self, video_path, segment_duration, output_dir):
+        """按关键帧分割视频"""
+        self.log(f"开始分割视频: {video_path}")
+
+        segments = []
+
+        # 创建分段目录
+        segment_dir = os.path.join(output_dir, "01_original_segments")
+        os.makedirs(segment_dir, exist_ok=True)
+
+        # 使用ffmpeg分割视频
+        segment_pattern = os.path.join(segment_dir, "segment_%03d.mp4")
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-c', 'copy',
+            '-map', '0',
+            '-segment_time', str(segment_duration),
+            '-f', 'segment',
+            '-reset_timestamps', '1',
+            '-segment_format', 'mp4',
+            '-segment_list', os.path.join(segment_dir, "segments_list.txt"),
+            segment_pattern
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+            # 获取生成的分段文件
+            for f in sorted(os.listdir(segment_dir)):
+                if f.startswith("segment_") and f.endswith(".mp4"):
+                    segment_file = os.path.join(segment_dir, f)
+                    segments.append(segment_file)
+                    self.log(f"创建分段 {len(segments)}: {f}")
+
+        except subprocess.CalledProcessError as e:
+            self.log(f"视频分割失败: {e.stderr}")
+            return []
+
+        self.log(f"视频分割完成，共{len(segments)}段")
+        return segments
+
+    def load_model(self):
+        """加载模型（测试模式下不加载）"""
+        if self.test_mode_var.get():
+            self.log("测试模式：跳过模型加载")
+            return None
+
+        model_name = self.model_var.get()
+        scale = int(self.scale_var.get())
+
+        # 确定权重路径
+        if model_name == "RRDB":
+            weight_path = self.models[model_name]["weight"][str(scale)]
+        else:
+            weight_path = self.models[model_name]["weight"]
+
+        # 检查权重文件是否存在
+        if not os.path.exists(weight_path):
+            raise FileNotFoundError(f"权重文件不存在: {weight_path}")
+
+        self.log(f"加载模型: {model_name}, 缩放: {scale}x")
+        self.log(f"权重文件: {weight_path}")
+
+        # 设置数据类型
+        if self.float16_var.get():
+            torch.backends.cudnn.benchmark = True
+            self.weight_dtype = torch.float16
+            self.log("使用FP16推理模式（加速）")
+        else:
+            self.weight_dtype = torch.float32
+            self.log("使用FP32推理模式（质量优先）")
+
+        # 加载模型
+        if model_name == "GRL":
+            generator = load_grl(weight_path, scale=scale)
+        elif model_name == "DAT":
+            generator = load_dat(weight_path, scale=scale)
+        elif model_name == "RRDB":
+            generator = load_rrdb(weight_path, scale=scale)
+        elif model_name == "CUNET":
+            generator = load_cunet(weight_path, scale=scale)
+        else:
+            raise ValueError(f"未知模型: {model_name}")
+
+        generator = generator.to(dtype=self.weight_dtype)
+        generator.eval()
+
+        # 移动到GPU
+        if torch.cuda.is_available():
+            generator = generator.cuda()
+
+        return generator
+
+    def process_single_frame(self, frame):
+        """处理单帧图像"""
+        if self.test_mode_var.get():
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        from torchvision.transforms import ToTensor
+
+        # 预处理
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # 下采样（如果需要）
+        scale = int(self.scale_var.get())
+        downsample_threshold = int(self.downsample_threshold.get())
+
+        h, w, _ = frame_rgb.shape
+        short_side = min(h, w)
+
+        original_h, original_w = h, w
+
+        if downsample_threshold != -1 and short_side > downsample_threshold:
+            rescale_factor = short_side / downsample_threshold
+            new_w = int(w / rescale_factor)
+            new_h = int(h / rescale_factor)
+            frame_rgb = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # 裁剪（如果需要）
+        if self.crop_for_4x_var.get() and scale == 4:
+            h, w, _ = frame_rgb.shape
+            if h % 4 != 0:
+                frame_rgb = frame_rgb[:4 * (h // 4), :, :]
+            if w % 4 != 0:
+                frame_rgb = frame_rgb[:, :4 * (w // 4), :]
+
+        # 转换为tensor并进行推理
+        img_tensor = ToTensor()(frame_rgb).unsqueeze(0)
+
+        if torch.cuda.is_available():
+            img_tensor = img_tensor.cuda()
+
+        img_tensor = img_tensor.to(dtype=self.weight_dtype)
+
+        with torch.no_grad():
+            result = self.generator(img_tensor)
+
+        # 转换为numpy数组
+        result_np = result[0].cpu().detach().numpy()
+        result_np = np.transpose(result_np, (1, 2, 0))
+        result_np = np.clip(result_np * 255.0, 0, 255).astype(np.uint8)
+
+        # 如果需要，缩放回原始大小
+        if downsample_threshold != -1 and short_side > downsample_threshold:
+            output_h = int(original_h * scale)
+            output_w = int(original_w * scale)
+            result_np = cv2.resize(result_np, (output_w, output_h), interpolation=cv2.INTER_LINEAR)
+
+        return result_np
+
+    def process_frame_with_enhanced_dup_detect(self, frame, frame_idx):
+        """处理单帧，包含增强的重复帧检测"""
+        is_duplicate = False
+
+        # 检查是否为重复帧
+        is_duplicate, matched_sr_result, current_hash, current_thumbnail = \
+            self.check_frame_duplicate_enhanced(frame, frame_idx)
+
+        if is_duplicate and matched_sr_result is not None:
+            # 找到重复帧，直接使用历史超分辨率结果
+            result_np = matched_sr_result
+
+            # 更新历史记录（使用匹配的帧信息）
+            if current_hash is None and self.use_hash_var.get():
+                current_hash = self.calculate_frame_hash(frame)
+            if current_thumbnail is None and self.use_ssim_var.get():
+                h, w = frame.shape[:2]
+                if h > 180 or w > 320:
+                    new_h = 180
+                    new_w = int(w * (180 / h))
+                    current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    current_thumbnail = frame.copy()
+
+            self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
+
+            return result_np, current_hash, current_thumbnail, is_duplicate
+
+        # 非重复帧，进行超分辨率处理
+        result_np = self.process_single_frame(frame)
+
+        # 计算当前帧的信息
+        if self.use_hash_var.get() and current_hash is None:
+            current_hash = self.calculate_frame_hash(frame)
+        if self.use_ssim_var.get() and current_thumbnail is None:
+            h, w = frame.shape[:2]
+            if h > 180 or w > 320:
+                new_h = 180
+                new_w = int(w * (180 / h))
+                current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                current_thumbnail = frame.copy()
+
+        # 更新历史记录
+        self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
+
+        return result_np, current_hash, current_thumbnail, is_duplicate
+
+    def process_segment_frames(self, segment_path, segment_index):
+        """处理视频片段的所有帧（逐帧处理）"""
+        segment_name = os.path.basename(segment_path)
+        self.log(f"处理片段 {segment_index}: {segment_name}")
+
+        if self.test_mode_var.get():
+            self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
+
+        # 初始化历史帧缓存
+        self.init_history_cache()
+
+        # 更新重复帧计数
+        self.update_dup_info(self.dup_frame_count)
+
+        # 为当前片段创建帧目录
+        before_dir, after_dir = self.setup_segment_frame_dirs(segment_index)
+
+        if not before_dir or not after_dir:
+            self.log("错误：无法创建帧目录")
+            return None, None
+
+        # 提取音频
+        audio_name = segment_name.replace('.mp4', '.aac')
+        audio_path = os.path.join(self.temp_base_dir, "02_audio", audio_name)
+        has_audio = self.extract_audio(segment_path, audio_path)
+
+        if has_audio:
+            self.log("音频提取成功")
+        else:
+            self.log("视频无音频或音频提取失败")
+
+        # 读取视频
+        cap = cv2.VideoCapture(segment_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if total_frames == 0:
+            self.log(f"警告: 无法获取片段 {segment_path} 的帧数")
+            cap.release()
+            return None, None
+
+        # 计算输出尺寸
+        scale = int(self.scale_var.get())
+        downsample_threshold = int(self.downsample_threshold.get())
+
+        short_side = min(height, width)
+        if downsample_threshold != -1 and short_side > downsample_threshold:
+            rescale_factor = short_side / downsample_threshold
+        else:
+            rescale_factor = 1
+
+        # 输出尺寸
+        output_width = int(width * scale / rescale_factor)
+        output_height = int(height * scale / rescale_factor)
+
+        self.log(f"输入尺寸: {width}x{height}, 输出尺寸: {output_width}x{output_height}")
+
+        # 显示检测参数
+        if self.enable_dup_detect_var.get():
+            methods = []
+            if self.use_hash_var.get():
+                methods.append(f"哈希(阈值:{self.hash_threshold_var.get()})")
+            if self.use_ssim_var.get():
+                methods.append(f"SSIM(阈值:{self.ssim_threshold_var.get()})")
+            self.log(f"重复帧检测: {', '.join(methods)}，历史帧数量: {self.history_size_var.get()}")
+
+        # 如果从进度恢复，跳过已处理的帧
+        start_frame = self.current_frame_in_segment
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            self.log(f"从第 {start_frame + 1} 帧恢复处理")
+
+        frame_idx = start_frame
+        frame_files = []
+
+        # 创建重复帧记录文件
+        dup_record_path = os.path.join(self.temp_base_dir, "05_logs", f"segment_{segment_index:03d}_duplicates.txt")
+        with open(dup_record_path, 'w', encoding='utf-8') as dup_file:
+            dup_file.write(f"片段 {segment_index} 重复帧记录\n")
+            dup_file.write(f"哈希阈值: {self.hash_threshold_var.get()}\n")
+            dup_file.write(f"SSIM阈值: {self.ssim_threshold_var.get()}\n")
+            dup_file.write(f"哈希检测: {'启用' if self.use_hash_var.get() else '禁用'}\n")
+            dup_file.write(f"SSIM检测: {'启用' if self.use_ssim_var.get() else '禁用'}\n")
+            dup_file.write(f"历史帧数量: {self.history_size_var.get()}\n")
+            dup_file.write("=" * 50 + "\n")
+            dup_file.write("帧号\t是否重复\t匹配帧号\t匹配原因\n")
+
+        # 初始化帧计数器
+        frames_processed = 0
+        segment_dup_count = 0  # 当前片段的重复帧数
+
+        while True:
+            # 检查是否被停止
+            if self.stopped:
+                self.log(f"停止处理：片段 {segment_index} 的第 {frame_idx + 1} 帧")
+                break
+
+            # 检查是否暂停 - 使用高效等待
+            if self.paused:
+                self.log(f"处理暂停于片段 {segment_index} 的第 {frame_idx + 1} 帧")
+                self.save_progress(force=True)  # 暂停时立即保存进度
+
+                # 释放GPU内存以降低占用
+                if not self.test_mode_var.get():
+                    torch.cuda.empty_cache()
+
+                # 高效等待，而不是忙等待
+                while self.paused and not self.stopped:
+                    time.sleep(1.0)  # 使用较长的休眠时间减少CPU占用
+                    if self.paused:  # 再次检查，避免错过状态变化
+                        # 在等待期间定期释放GPU内存
+                        if frame_idx % 10 == 0 and not self.test_mode_var.get():
+                            torch.cuda.empty_cache()
+
+                if self.stopped:
+                    break
+
+                # 恢复时重新加载模型（如果需要）
+                if not self.test_mode_var.get() and self.generator is None:
+                    try:
+                        self.generator = self.load_model()
+                    except Exception as e:
+                        self.log(f"恢复时重新加载模型失败: {e}")
+                        break
+
+                self.log(f"处理继续于片段 {segment_index} 的第 {frame_idx + 1} 帧")
+
+            # 读取帧
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 保存原始帧到before_frames目录
+            before_path = os.path.join(before_dir, f"frame_{frame_idx:06d}.png")
+            cv2.imwrite(before_path, frame)
+
+            # 使用增强的重复帧检测处理帧
+            sr_frame, current_hash, current_thumbnail, is_duplicate = \
+                self.process_frame_with_enhanced_dup_detect(frame, frame_idx)
+
+            # 保存处理后的帧到after_frames目录
+            after_path = os.path.join(after_dir, f"frame_{frame_idx:06d}.png")
+            sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(after_path, sr_frame_bgr)
+
+            # 添加到帧文件列表
+            if not self.test_mode_var.get():
+                frame_files.append(after_path)
+
+            # 记录重复帧信息
+            with open(dup_record_path, 'a', encoding='utf-8') as dup_file:
+                if is_duplicate:
+                    matched_idx = self.frame_idx_history[0] if self.frame_idx_history else "未知"
+                    dup_file.write(f"{frame_idx}\t是\t{matched_idx}\t重复帧，使用历史结果\n")
+                    segment_dup_count += 1
+                else:
+                    dup_file.write(f"{frame_idx}\t否\t-\t正常处理\n")
+
+            # 更新当前帧
+            self.current_frame_in_segment = frame_idx + 1
+            frames_processed += 1
+
+            # 更新详细进度
+            self.update_detailed_progress(self.current_frame_in_segment, total_frames)
+
+            # 每处理10帧保存一次进度
+            if frames_processed % 10 == 0:
+                self.save_progress(force=True)
+
+            # 更新进度条
+            progress = (self.current_frame_in_segment / total_frames) * 100
+            self.update_progress(progress)
+
+            frame_idx += 1
+
+            # 每处理50帧清理一次GPU内存
+            if frame_idx % 50 == 0 and not self.test_mode_var.get():
+                torch.cuda.empty_cache()
+
+        cap.release()
+
+        # 记录重复帧统计
+        if self.enable_dup_detect_var.get():
+            self.log(f"片段处理完成: {segment_name}，检测到 {segment_dup_count} 个重复帧")
+        else:
+            self.log(f"片段处理完成: {segment_name}")
+
+        # 清空历史缓存以释放内存
+        self.frame_history.clear()
+        self.frame_hash_history.clear()
+        if hasattr(self, 'frame_thumbnail_history'):
+            self.frame_thumbnail_history.clear()
+        self.frame_sr_history.clear()
+        self.frame_idx_history.clear()
+
+        return frame_files, audio_path
+
+    def frames_to_video(self, frame_files, output_path, fps, width, height, audio_path=None):
+        """将帧序列转换为视频"""
+        self.log(f"正在生成视频: {output_path}")
+
+        if not frame_files:
+            self.log("错误: 没有可用的帧文件")
+            return False
+
+        # 创建临时视频文件（无音频）
+        temp_video_path = output_path.replace('.mp4', '_temp.mp4')
+
+        # 创建视频写入器
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+
+        # 按顺序写入所有帧
+        for frame_file in sorted(frame_files):
+            if os.path.exists(frame_file):
+                frame = cv2.imread(frame_file)
+                if frame is not None:
+                    # 调整帧大小以匹配输出尺寸
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        frame = cv2.resize(frame, (width, height))
+                    out.write(frame)
+
+        out.release()
+
+        # 如果有音频，合并音频和视频
+        if audio_path and os.path.exists(audio_path):
+            self.log("合并音频和视频...")
+
+            # 使用ffmpeg合并
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', temp_video_path,
+                '-i', audio_path,
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-shortest',
+                output_path
+            ]
+
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                self.log("音频视频合并成功")
+
+                # 删除临时文件
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+                return True
+            except subprocess.CalledProcessError as e:
+                self.log(f"音频视频合并失败: {e.stderr}")
+                # 如果合并失败，使用临时视频文件作为输出
+                if os.path.exists(temp_video_path):
+                    shutil.move(temp_video_path, output_path)
+                return True
+        else:
+            # 如果没有音频，直接使用临时视频文件
+            if os.path.exists(temp_video_path):
+                shutil.move(temp_video_path, output_path)
+                return True
+
+        return False
+
+    def concatenate_videos(self, video_list, output_path):
+        """拼接视频片段"""
+        self.log("开始拼接视频片段...")
+
+        # 创建临时文件列表
+        list_file = tempfile.mktemp(suffix=".txt")
+
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for video in video_list:
+                f.write(f"file '{os.path.abspath(video)}'\n")
+
+        # 使用ffmpeg拼接
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-c', 'copy',
+            output_path
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            self.log(f"视频拼接完成: {output_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log(f"视频拼接失败: {e.stderr}")
+            raise
+        finally:
+            if os.path.exists(list_file):
+                os.remove(list_file)
+
+    def process_video(self):
+        """主处理函数"""
+        try:
+            # 检查输入
+            input_path = self.input_path.get()
+            if not input_path or not os.path.exists(input_path):
+                messagebox.showerror("错误", "请选择有效的输入视频文件")
+                return
+
+            output_dir = self.output_dir.get()
+            if not output_dir:
+                messagebox.showerror("错误", "请选择输出目录")
+                return
+
+            # 设置视频基础名称
+            self.video_base_name = Path(input_path).stem
+
+            # 验证参数
+            try:
+                hash_threshold = int(self.hash_threshold_var.get())
+                ssim_threshold = float(self.ssim_threshold_var.get())
+
+                if hash_threshold < 0 or hash_threshold > 10:
+                    messagebox.showwarning("警告", "哈希相似度阈值必须在0-10之间")
+                    self.hash_threshold_var.set("3")
+                    return
+
+                if ssim_threshold < 0.9 or ssim_threshold > 1.0:
+                    messagebox.showwarning("警告", "SSIM阈值必须在0.9-1.0之间")
+                    self.ssim_threshold_var.set("0.98")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "参数格式错误")
+                return
+
+            # 创建输出目录
+            os.makedirs(output_dir, exist_ok=True)
+
+            # 设置临时目录（基于视频文件名）
+            temp_dirs = self.setup_temp_dirs()
+            if not temp_dirs:
+                raise ValueError("无法创建临时目录")
+
+            self.log(f"临时文件目录: {temp_dirs['base']}")
+
+            if self.test_mode_var.get():
+                self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
+
+            # 更新状态
+            self.processing = True
+            self.paused = False
+            self.stopped = False
+            self.process_btn.config(state='disabled')
+            self.pause_btn.config(state='normal')
+            self.stop_btn.config(state='normal')
+            self.update_status("处理中...", "blue")
+
+            # 检查是否有进度数据
+            progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+
+            if os.path.exists(progress_file):
+                try:
+                    with open(progress_file, 'rb') as f:
+                        progress_data = pickle.load(f)
+
+                    # 恢复进度
+                    self.current_segment_index = progress_data.get('current_segment_index', 0)
+                    self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
+                    self.total_segments = progress_data.get('total_segments', 0)
+                    self.segments = progress_data.get('segments', [])
+                    self.processed_segments = progress_data.get('processed_segments', [])
+                    self.dup_frame_count = progress_data.get('dup_frame_count', 0)
+
+                    self.log(
+                        f"恢复进度: 片段 {self.current_segment_index + 1}/{self.total_segments} 的第 {self.current_frame_in_segment + 1} 帧")
+                    self.update_dup_info(self.dup_frame_count)
+                except Exception as e:
+                    self.log(f"加载进度数据时出错: {e}")
+                    self.current_segment_index = 0
+                    self.current_frame_in_segment = 0
+                    self.processed_segments = []
+                    self.dup_frame_count = 0
+
+            # 步骤1: 加载模型
+            self.log("步骤1: 加载模型...")
+            self.update_progress(0)
+            self.generator = self.load_model()
+            self.update_progress(5)
+
+            # 步骤2: 分割视频（如果需要）
+            if not self.segments or self.current_segment_index == 0:
+                self.log("步骤2: 分割视频...")
+                segment_duration = float(self.segment_duration.get())
+                self.segments = self.split_video_by_keyframes(input_path, segment_duration, temp_dirs['base'])
+                self.total_segments = len(self.segments)
+                self.update_progress(10)
+
+                if not self.segments:
+                    raise ValueError("视频分割失败")
+
+                # 重置进度
+                self.current_segment_index = 0
+                self.current_frame_in_segment = 0
+                self.processed_segments = []
+            else:
+                self.log(f"步骤2: 使用已有的 {len(self.segments)} 个片段")
+                self.update_progress(10)
+
+            # 保存初始进度
+            self.save_progress(force=True)
+
+            # 步骤3: 逐帧处理每个片段
+            self.log("步骤3: 处理视频片段...")
+
+            all_processed_frames = []
+            all_audio_paths = []
+
+            for i in range(self.current_segment_index, len(self.segments)):
+                # 检查是否被停止
+                if self.stopped:
+                    self.log(f"处理被用户停止于片段 {i + 1}")
+                    self.save_progress(force=True)
+                    break
+
+                segment = self.segments[i]
+                segment_name = os.path.basename(segment)
+
+                # 检查是否已经处理过
+                if segment_name in self.processed_segments:
+                    self.log(f"跳过已处理的片段 {i + 1}/{len(self.segments)}: {segment_name}")
+                    self.current_segment_index = i + 1
+                    self.current_frame_in_segment = 0
+                    continue
+
+                self.log(f"处理片段 {i + 1}/{len(self.segments)}: {segment_name}")
+                frame_files, audio_path = self.process_segment_frames(segment, i + 1)
+
+                # 检查是否被停止
+                if self.stopped:
+                    self.save_progress(force=True)
+                    break
+
+                if frame_files and not self.test_mode_var.get():
+                    # 生成处理后的片段视频
+                    output_segment = os.path.join(temp_dirs['processed_segments'], f"processed_{segment_name}")
+
+                    # 获取视频参数
+                    cap = cv2.VideoCapture(segment)
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
+
+                    # 计算输出尺寸
+                    scale = int(self.scale_var.get())
+                    downsample_threshold = int(self.downsample_threshold.get())
+                    short_side = min(height, width)
+
+                    if downsample_threshold != -1 and short_side > downsample_threshold:
+                        rescale_factor = short_side / downsample_threshold
+                    else:
+                        rescale_factor = 1
+
+                    output_width = int(width * scale / rescale_factor)
+                    output_height = int(height * scale / rescale_factor)
+
+                    # 将帧转换为视频
+                    self.frames_to_video(frame_files, output_segment, fps, output_width, output_height, audio_path)
+
+                    all_processed_frames.extend(frame_files)
+                    if audio_path:
+                        all_audio_paths.append(audio_path)
+                elif self.test_mode_var.get():
+                    self.log(f"测试模式：片段 {i + 1} 处理完成，帧文件已保存")
+
+                # 更新进度
+                self.current_segment_index = i + 1
+                self.current_frame_in_segment = 0
+                self.processed_segments.append(segment_name)
+                self.update_progress_info()
+
+                # 保存进度
+                self.save_progress(force=True)
+
+                # 清理当前片段的帧目录
+                self.log(f"清理片段 {i + 1} 的临时帧文件...")
+                self.cleanup_segment_frame_dirs(i + 1)
+
+                # 更新总体进度
+                overall_progress = 10 + (i + 1) / len(self.segments) * 60
+                self.update_progress(overall_progress)
+
+                # 处理完一个片段后清理GPU内存
+                if not self.test_mode_var.get():
+                    torch.cuda.empty_cache()
+
+            if self.stopped:
+                self.log(
+                    f"处理已停止，进度已保存于片段 {self.current_segment_index} 的第 {self.current_frame_in_segment} 帧")
+                self.update_status("已停止，进度已保存", "orange")
+                self.save_progress(force=True)
+                return
+
+            # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
+            if not self.test_mode_var.get():
+                self.log("步骤4: 拼接处理后的视频片段...")
+                processed_segments_paths = []
+                for segment_name in self.processed_segments:
+                    processed_path = os.path.join(temp_dirs['processed_segments'], f"processed_{segment_name}")
+                    if os.path.exists(processed_path):
+                        processed_segments_paths.append(processed_path)
+
+                if processed_segments_paths:
+                    if len(processed_segments_paths) > 1:
+                        output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                        final_output = os.path.join(output_dir, output_filename)
+                        self.concatenate_videos(processed_segments_paths, final_output)
+                    else:
+                        # 如果只有一个片段，直接复制
+                        output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                        final_output = os.path.join(output_dir, output_filename)
+                        shutil.copy2(processed_segments_paths[0], final_output)
+
+                    self.update_progress(95)
+                    self.log(f"最终输出文件: {final_output}")
+                else:
+                    self.log("没有可拼接的片段")
+            else:
+                self.log("测试模式：跳过视频合成步骤")
+                self.update_progress(95)
+
+            # 步骤5: 清理临时文件和进度记录
+            self.log("步骤5: 清理临时文件...")
+
+            # 删除进度文件
+            if os.path.exists(progress_file):
+                os.remove(progress_file)
+
+            self.update_progress(100)
+
+            if self.test_mode_var.get():
+                self.update_status("测试完成！", "green")
+                self.log("测试模式完成！")
+                self.log(f"重复帧检测统计：总计检测到 {self.dup_frame_count} 个重复帧")
+                self.log(f"测试结果保存在: {temp_dirs['base']}")
+
+                # 显示完成消息
+                messagebox.showinfo("测试完成",
+                                    f"重复帧检测测试完成！\n\n"
+                                    f"检测到 {self.dup_frame_count} 个重复帧\n"
+                                    f"测试结果保存在: {temp_dirs['base']}\n\n"
+                                    f"请检查重复帧记录文件")
+            else:
+                self.update_status("处理完成！", "green")
+
+                # 显示完成消息
+                if all_processed_frames:
+                    output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                    self.log(f"处理完成！输出文件: {output_filename}")
+                    # 显示重复帧统计
+                    if self.enable_dup_detect_var.get():
+                        self.log(f"总计检测到 {self.dup_frame_count} 个重复帧，已复用处理结果，加速了处理速度")
+
+                    messagebox.showinfo("完成",
+                                        f"视频处理完成！\n\n"
+                                        f"输出文件: {output_filename}\n"
+                                        f"输出目录: {output_dir}\n\n"
+                                        f"重复帧检测: {self.dup_frame_count} 帧已复用")
+                else:
+                    self.log("处理完成！但没有生成输出文件")
+
+            # 重置状态
+            self.current_segment_index = 0
+            self.current_frame_in_segment = 0
+            self.total_segments = 0
+            self.segments = []
+            self.processed_segments = []
+            self.dup_frame_count = 0
+            self.update_dup_info(0)
+
+            # 清空历史缓存
+            self.frame_history.clear()
+            self.frame_hash_history.clear()
+            if hasattr(self, 'frame_thumbnail_history'):
+                self.frame_thumbnail_history.clear()
+            self.frame_sr_history.clear()
+            self.frame_idx_history.clear()
+
+        except Exception as e:
+            self.log(f"处理失败: {str(e)}")
+            self.update_status(f"处理失败: {str(e)}", "red")
+            messagebox.showerror("错误", f"处理失败: {str(e)}")
+            # 保存进度以便恢复
+            self.save_progress(force=True)
+        finally:
+            self.processing = False
+            self.paused = False
+            self.stopped = False
+            self.process_btn.config(state='normal')
+            self.pause_btn.config(state='disabled', text="⏸ 暂停")
+            self.stop_btn.config(state='disabled')
+
+            # 清理GPU内存
+            if self.generator and not self.test_mode_var.get():
+                del self.generator
+                torch.cuda.empty_cache()
+
+    def start_processing(self):
+        """开始处理"""
+        if self.processing:
+            return
+
+        # 验证参数
+        try:
+            scale = int(self.scale_var.get())
+            model = self.model_var.get()
+            batch_size = int(self.batch_size_var.get())
+
+            if model in ["GRL", "DAT"] and scale != 4:
+                messagebox.showwarning("警告", f"{model}模型只支持4倍缩放")
+                self.scale_var.set("4")
+                return
+
+            if scale not in [2, 4]:
+                messagebox.showwarning("警告", "缩放因子必须是2或4")
+                return
+
+            if batch_size < 1 or batch_size > 2:
+                messagebox.showwarning("警告", "6GB GPU批处理大小建议为1-2")
+                self.batch_size_var.set("1")
+                return
+        except ValueError:
+            messagebox.showerror("错误", "参数格式错误")
+            return
+
+        # 在新线程中运行处理
+        self.processing_thread = threading.Thread(target=self.process_video)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+
+    def toggle_pause(self):
+        """切换暂停/继续状态"""
+        if not self.processing:
+            return
+
+        if self.paused:
+            # 继续处理
+            self.paused = False
+            self.pause_btn.config(text="⏸ 暂停")
+            self.update_status("处理中...", "blue")
+            self.log("处理继续")
+
+            # 通知暂停的线程继续
+            with self.pause_cv:
+                self.pause_cv.notify_all()
+        else:
+            # 暂停处理
+            self.paused = True
+            self.pause_btn.config(text="▶ 继续")
+            self.update_status("已暂停", "orange")
+            self.log("处理暂停，保存进度...")
+            self.save_progress(force=True)
+
+    def stop_processing(self):
+        """停止处理"""
+        if not self.processing:
+            return
+
+        response = messagebox.askyesnocancel("停止处理",
+                                             "请选择停止方式：\n\n"
+                                             "是：保存进度并停止，下次可以继续\n"
+                                             "否：直接停止，不保存进度\n"
+                                             "取消：返回继续处理")
+
+        if response is None:  # 取消
+            return
+
+        if response:  # 是：保存进度并停止
+            self.log("正在停止处理并保存进度...")
+            self.update_status("正在停止并保存进度...", "orange")
+            self.stopped = True
+            self.paused = False  # 确保暂停状态被清除
+
+            # 通知暂停的线程继续（如果是暂停状态）
+            with self.pause_cv:
+                self.pause_cv.notify_all()
+
+            # 等待处理线程响应
+            time.sleep(0.5)
+
+            # 强制保存进度
+            self.save_progress(force=True)
+
+            # 等待处理线程结束
+            if self.processing_thread and self.processing_thread.is_alive():
+                self.processing_thread.join(timeout=2.0)
+
+            self.log("处理已停止，进度已保存")
+            self.update_status("已停止，进度已保存", "orange")
+
+        else:  # 否：直接停止，不保存进度
+            self.log("正在停止处理，不保存进度...")
+            self.update_status("正在停止...", "orange")
+            self.stopped = True
+            self.paused = False  # 确保暂停状态被清除
+
+            # 通知暂停的线程继续（如果是暂停状态）
+            with self.pause_cv:
+                self.pause_cv.notify_all()
+
+            # 等待处理线程响应
+            time.sleep(0.5)
+
+            # 删除进度文件
+            if self.temp_base_dir:
+                progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+                if os.path.exists(progress_file):
+                    try:
+                        os.remove(progress_file)
+                        self.log("已删除进度文件")
+                    except:
+                        pass
+
+            # 等待处理线程结束
+            if self.processing_thread and self.processing_thread.is_alive():
+                self.processing_thread.join(timeout=2.0)
+
+            self.log("处理已停止，进度未保存")
+            self.update_status("已停止，进度未保存", "orange")
+
+            # 重置进度
+            self.current_segment_index = 0
+            self.current_frame_in_segment = 0
+            self.dup_frame_count = 0
+            self.update_dup_info(0)
+
+        # 重置按钮状态
+        self.process_btn.config(state='normal')
+        self.pause_btn.config(state='disabled', text="⏸ 暂停")
+        self.stop_btn.config(state='disabled')
+        self.paused = False
+        self.processing = False
+
+    def run(self):
+        """运行GUI"""
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # 居中显示窗口
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+
+        self.root.mainloop()
+
+    def on_closing(self):
+        """关闭窗口时的清理"""
+        if self.processing:
+            response = messagebox.askyesnocancel("退出",
+                                                 "处理仍在进行中，您可以选择:\n\n"
+                                                 "是: 保存进度并退出\n"
+                                                 "否: 不保存进度直接退出\n"
+                                                 "取消: 继续处理")
+
+            if response is True:  # 保存进度并退出
+                self.log("保存进度并退出...")
+                self.save_progress(force=True)
+                self.processing = False
+                self.stopped = True
+                self.paused = False
+
+                # 通知暂停的线程继续（如果是暂停状态）
+                with self.pause_cv:
+                    self.pause_cv.notify_all()
+
+                time.sleep(1.0)  # 给线程更多时间响应
+                self.root.destroy()
+            elif response is False:  # 直接退出
+                self.log("直接退出，不保存进度")
+                self.processing = False
+                self.stopped = True
+                self.paused = False
+
+                # 通知暂停的线程继续（如果是暂停状态）
+                with self.pause_cv:
+                    self.pause_cv.notify_all()
+
+                time.sleep(1.0)  # 给线程更多时间响应
+                self.root.destroy()
+            # 如果选择取消，什么都不做，继续处理
+        else:
+            self.root.destroy()
+
+
+def main():
+    """主函数"""
+    app = APISRVideoProcessor()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

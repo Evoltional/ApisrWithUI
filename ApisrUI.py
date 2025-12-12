@@ -25,7 +25,17 @@ warnings.filterwarnings('ignore')
 
 # 添加APISR项目路径
 sys.path.append('.')
-from test_code.test_utils import load_grl, load_rrdb, load_dat, load_cunet
+
+# 直接从architecture导入模型
+try:
+    from architecture.rrdb import RRDBNet
+    from architecture.grl import GRL
+    from architecture.dat import DAT
+    from architecture.cunet import UNet_Full
+except ImportError as e:
+    print(f"导入模型架构时出错: {e}")
+    print("请确保architecture模块在Python路径中")
+    sys.exit(1)
 
 
 class ModernButton(ttk.Button):
@@ -178,7 +188,7 @@ class APISRVideoProcessor:
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v1.6",  # 更新版本号
+        version_label = tk.Label(title_frame, text="v1.6",
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
@@ -764,6 +774,182 @@ class APISRVideoProcessor:
         except Exception as e:
             self.log(f"保存进度时出错: {e}")
 
+    # ============================================================
+    # 模型加载函数（从test_utils.py整合）
+    # ============================================================
+
+    def load_rrdb(self, generator_weight_PATH, scale, print_options=False):
+        '''加载RRDB模型'''
+        # 加载检查点
+        checkpoint_g = torch.load(generator_weight_PATH)
+
+        # 查找生成器权重
+        if 'params_ema' in checkpoint_g:
+            # 对于官方的ESRNET/ESRGAN权重
+            weight = checkpoint_g['params_ema']
+            generator = RRDBNet(3, 3, scale=scale)  # 默认块数为6
+
+        elif 'params' in checkpoint_g:
+            # 对于官方的ESRNET/ESRGAN权重
+            weight = checkpoint_g['params']
+            generator = RRDBNet(3, 3, scale=scale)
+
+        elif 'model_state_dict' in checkpoint_g:
+            # 对于个人训练的权重
+            weight = checkpoint_g['model_state_dict']
+            generator = RRDBNet(3, 3, scale=scale)
+
+        else:
+            raise ValueError("This weight is not supported")
+
+        # 处理torch.compile权重键重命名
+        old_keys = [key for key in weight]
+        for old_key in old_keys:
+            if old_key[:10] == "_orig_mod.":
+                new_key = old_key[10:]
+                weight[new_key] = weight[old_key]
+                del weight[old_key]
+
+        generator.load_state_dict(weight)
+        generator = generator.eval().cuda()
+
+        # 打印选项以显示使用了哪些设置
+        if print_options:
+            if 'opt' in checkpoint_g:
+                for key in checkpoint_g['opt']:
+                    value = checkpoint_g['opt'][key]
+                    print(f'{key} : {value}')
+
+        return generator
+
+    def load_cunet(self, generator_weight_PATH, scale, print_options=False):
+        '''加载CUNET模型'''
+        if scale != 2:
+            raise NotImplementedError("We only support 2x in CUNET")
+
+        # 加载检查点
+        checkpoint_g = torch.load(generator_weight_PATH)
+
+        # 查找生成器权重
+        if 'model_state_dict' in checkpoint_g:
+            # 对于个人训练的权重
+            weight = checkpoint_g['model_state_dict']
+            loss = checkpoint_g["lowest_generator_weight"]
+            if "iteration" in checkpoint_g:
+                iteration = checkpoint_g["iteration"]
+            else:
+                iteration = "NAN"
+            generator = UNet_Full()
+            # generator = torch.compile(generator)  # torch.compile
+            self.log(f"the generator weight is {loss} at iteration {iteration}")
+
+        else:
+            raise ValueError("This weight is not supported")
+
+        # 处理torch.compile权重键重命名
+        old_keys = [key for key in weight]
+        for old_key in old_keys:
+            if old_key[:10] == "_orig_mod.":
+                new_key = old_key[10:]
+                weight[new_key] = weight[old_key]
+                del weight[old_key]
+
+        generator.load_state_dict(weight)
+        generator = generator.eval().cuda()
+
+        # 打印选项以显示使用了哪些设置
+        if print_options:
+            if 'opt' in checkpoint_g:
+                for key in checkpoint_g['opt']:
+                    value = checkpoint_g['opt'][key]
+                    print(f'{key} : {value}')
+
+        return generator
+
+    def load_grl(self, generator_weight_PATH, scale=4):
+        '''加载GRL模型'''
+        # 加载检查点
+        checkpoint_g = torch.load(generator_weight_PATH)
+
+        # 查找生成器权重
+        if 'model_state_dict' in checkpoint_g:
+            weight = checkpoint_g['model_state_dict']
+
+            # GRL tiny模型（注意：tiny2版本）
+            generator = GRL(
+                upscale=scale,
+                img_size=64,
+                window_size=8,
+                depths=[4, 4, 4, 4],
+                embed_dim=64,
+                num_heads_window=[2, 2, 2, 2],
+                num_heads_stripe=[2, 2, 2, 2],
+                mlp_ratio=2,
+                qkv_proj_type="linear",
+                anchor_proj_type="avgpool",
+                anchor_window_down_factor=2,
+                out_proj_type="linear",
+                conv_type="1conv",
+                upsampler="nearest+conv",  # 更改
+            ).cuda()
+
+        else:
+            raise ValueError("This weight is not supported")
+
+        generator.load_state_dict(weight)
+        generator = generator.eval().cuda()
+
+        # 计算参数数量
+        num_params = 0
+        for p in generator.parameters():
+            if p.requires_grad:
+                num_params += p.numel()
+        self.log(f"GRL模型参数数量: {num_params / 10 ** 6: 0.2f}M")
+
+        return generator
+
+    def load_dat(self, generator_weight_PATH, scale=4):
+        '''加载DAT模型'''
+        # 加载检查点
+        checkpoint_g = torch.load(generator_weight_PATH)
+
+        # 查找生成器权重
+        if 'model_state_dict' in checkpoint_g:
+            weight = checkpoint_g['model_state_dict']
+
+            # 默认的DAT小模型
+            generator = DAT(upscale=4,
+                            in_chans=3,
+                            img_size=64,
+                            img_range=1.,
+                            depth=[6, 6, 6, 6, 6, 6],
+                            embed_dim=180,
+                            num_heads=[6, 6, 6, 6, 6, 6],
+                            expansion_factor=2,
+                            resi_connection='1conv',
+                            split_size=[8, 16],
+                            upsampler='pixelshuffledirect',
+                            ).cuda()
+
+        else:
+            raise ValueError("This weight is not supported")
+
+        generator.load_state_dict(weight)
+        generator = generator.eval().cuda()
+
+        # 计算参数数量
+        num_params = 0
+        for p in generator.parameters():
+            if p.requires_grad:
+                num_params += p.numel()
+        self.log(f"DAT模型参数数量: {num_params / 10 ** 6: 0.2f}M")
+
+        return generator
+
+    # ============================================================
+    # 重复帧检测函数
+    # ============================================================
+
     def calculate_frame_hash(self, frame):
         """计算帧的感知哈希值（优化版）"""
         # 先缩小图像以减少计算量
@@ -932,6 +1118,10 @@ class APISRVideoProcessor:
         self.frame_sr_history.append(sr_result.copy() if sr_result is not None else None)
         self.frame_idx_history.append(frame_idx)
 
+    # ============================================================
+    # 视频处理函数
+    # ============================================================
+
     def extract_audio(self, video_path, audio_path):
         """提取音频"""
         cmd = [
@@ -1026,13 +1216,13 @@ class APISRVideoProcessor:
 
         # 加载模型
         if model_name == "GRL":
-            generator = load_grl(weight_path, scale=scale)
+            generator = self.load_grl(weight_path, scale=scale)
         elif model_name == "DAT":
-            generator = load_dat(weight_path, scale=scale)
+            generator = self.load_dat(weight_path, scale=scale)
         elif model_name == "RRDB":
-            generator = load_rrdb(weight_path, scale=scale)
+            generator = self.load_rrdb(weight_path, scale=scale)
         elif model_name == "CUNET":
-            generator = load_cunet(weight_path, scale=scale)
+            generator = self.load_cunet(weight_path, scale=scale)
         else:
             raise ValueError(f"未知模型: {model_name}")
 

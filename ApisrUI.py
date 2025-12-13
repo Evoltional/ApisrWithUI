@@ -9,6 +9,7 @@ import time
 import tkinter as tk
 import warnings
 import collections
+import json
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
@@ -66,8 +67,8 @@ class APISRVideoProcessor:
         self.warning_color = "#f39c12"
         self.danger_color = "#e74c3c"
 
-        # 设置样式
-        self.setup_styles()
+        # 配置文件路径
+        self.config_file = "apisr_config.json"
 
         # 初始化变量
         self.input_path = tk.StringVar()
@@ -86,7 +87,11 @@ class APISRVideoProcessor:
         self.use_ssim_var = tk.BooleanVar(value=True)
         self.use_hash_var = tk.BooleanVar(value=True)
         self.test_mode_var = tk.BooleanVar(value=False)
-        self.history_size_var = tk.StringVar(value="40")  # 新增：历史帧数量
+        self.enable_history_var = tk.BooleanVar(value=True)  # 新增：历史帧开关
+        self.history_size_var = tk.StringVar(value="20")
+
+        # 设置样式
+        self.setup_styles()
 
         # 模型信息
         self.models = {
@@ -138,7 +143,128 @@ class APISRVideoProcessor:
         self.pause_cv = threading.Condition(self.pause_lock)
         self.should_sleep = False  # 用于控制暂停时是否让线程休眠
 
+        # 设置历史帧数量验证
+        self.setup_history_size_validation()
+
         self.setup_ui()
+
+        # 设置初始模型
+        self.on_model_change()
+
+        # 加载配置文件
+        self.load_config()
+
+        # 绑定配置保存事件
+        self.setup_config_save_bindings()
+
+    def load_config(self):
+        """加载配置文件"""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+
+                # 设置变量
+                if 'model' in config:
+                    self.model_var.set(config['model'])
+                if 'scale' in config:
+                    self.scale_var.set(str(config['scale']))
+                if 'segment_duration' in config:
+                    self.segment_duration.set(str(config['segment_duration']))
+                if 'downsample_threshold' in config:
+                    self.downsample_threshold.set(str(config['downsample_threshold']))
+                if 'float16' in config:
+                    self.float16_var.set(config['float16'])
+                if 'crop_for_4x' in config:
+                    self.crop_for_4x_var.set(config['crop_for_4x'])
+                if 'batch_size' in config:
+                    self.batch_size_var.set(str(config['batch_size']))
+                if 'tile_size' in config:
+                    self.tile_size_var.set(str(config['tile_size']))
+                if 'hash_threshold' in config:
+                    self.hash_threshold_var.set(str(config['hash_threshold']))
+                if 'ssim_threshold' in config:
+                    self.ssim_threshold_var.set(str(config['ssim_threshold']))
+                if 'enable_dup_detect' in config:
+                    self.enable_dup_detect_var.set(config['enable_dup_detect'])
+                if 'use_ssim' in config:
+                    self.use_ssim_var.set(config['use_ssim'])
+                if 'use_hash' in config:
+                    self.use_hash_var.set(config['use_hash'])
+                if 'test_mode' in config:
+                    self.test_mode_var.set(config['test_mode'])
+                if 'enable_history' in config:
+                    self.enable_history_var.set(config['enable_history'])
+                if 'history_size' in config:
+                    self.history_size_var.set(str(config['history_size']))
+
+                self.log(f"已从 {self.config_file} 加载配置")
+
+                # 更新UI状态
+                self.on_model_change()
+                self.toggle_history_settings()
+            except Exception as e:
+                self.log(f"加载配置文件时出错: {e}")
+        else:
+            self.log("未找到配置文件，使用默认配置")
+
+    def save_config(self):
+        """保存配置文件"""
+        try:
+            config = {
+                'model': self.model_var.get(),
+                'scale': int(self.scale_var.get()),
+                'segment_duration': int(self.segment_duration.get()),
+                'downsample_threshold': int(self.downsample_threshold.get()),
+                'float16': self.float16_var.get(),
+                'crop_for_4x': self.crop_for_4x_var.get(),
+                'batch_size': int(self.batch_size_var.get()),
+                'tile_size': int(self.tile_size_var.get()),
+                'hash_threshold': int(self.hash_threshold_var.get()),
+                'ssim_threshold': float(self.ssim_threshold_var.get()),
+                'enable_dup_detect': self.enable_dup_detect_var.get(),
+                'use_ssim': self.use_ssim_var.get(),
+                'use_hash': self.use_hash_var.get(),
+                'test_mode': self.test_mode_var.get(),
+                'enable_history': self.enable_history_var.get(),
+                'history_size': int(self.history_size_var.get()),
+                'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+
+            self.log(f"配置已保存到 {self.config_file}")
+        except Exception as e:
+            self.log(f"保存配置文件时出错: {e}")
+
+    def setup_history_size_validation(self):
+        """设置历史帧数量输入的验证"""
+
+        def validate_history_size(*args):
+            # 获取当前值
+            current_value = self.history_size_var.get()
+
+            # 如果不是数字，恢复为默认值20
+            if not current_value.isdigit():
+                self.history_size_var.set("20")
+                return
+
+            # 转换为整数
+            try:
+                history_size = int(current_value)
+
+                # 限制范围在1-100之间
+                if history_size < 1:
+                    self.history_size_var.set("1")
+                elif history_size > 100:
+                    self.history_size_var.set("100")
+            except ValueError:
+                # 如果转换失败，恢复为默认值20
+                self.history_size_var.set("20")
+
+        # 添加trace监听变量变化
+        self.history_size_var.trace('w', lambda *args: validate_history_size())
 
     def setup_styles(self):
         """设置UI样式"""
@@ -156,10 +282,23 @@ class APISRVideoProcessor:
 
     def init_history_cache(self):
         """初始化历史帧缓存"""
-        try:
-            history_size = int(self.history_size_var.get())
-        except:
-            history_size = 40
+        # 检查历史帧开关
+        if not self.enable_history_var.get():
+            # 如果历史帧功能关闭，使用默认值1（只与前一帧比较）
+            history_size = 1
+        else:
+            try:
+                history_size = int(self.history_size_var.get())
+                # 确保历史帧数量在有效范围内
+                if history_size < 1:
+                    history_size = 1
+                    self.history_size_var.set("1")
+                elif history_size > 100:
+                    history_size = 100
+                    self.history_size_var.set("100")
+            except:
+                history_size = 20  # 默认值
+                self.history_size_var.set("20")
 
         self.frame_history = collections.deque(maxlen=history_size)
         self.frame_hash_history = collections.deque(maxlen=history_size)
@@ -171,6 +310,12 @@ class APISRVideoProcessor:
 
         self.frame_sr_history = collections.deque(maxlen=history_size)
         self.frame_idx_history = collections.deque(maxlen=history_size)
+
+        # 记录历史帧设置
+        if hasattr(self, 'log_text') and self.enable_history_var.get():
+            self.log(f"历史帧功能已启用，缓存大小: {history_size} 帧")
+        elif hasattr(self, 'log_text') and not self.enable_history_var.get():
+            self.log("历史帧功能已禁用，只与前一帧比较")
 
     def setup_ui(self):
         """设置UI布局"""
@@ -188,7 +333,7 @@ class APISRVideoProcessor:
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v1.6",
+        version_label = tk.Label(title_frame, text="v1.7",  # 更新版本号
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
@@ -278,6 +423,10 @@ class APISRVideoProcessor:
         ttk.Button(right_btn_frame, text="清空日志",
                    command=self.clear_log, width=12).pack(side=tk.RIGHT, padx=2)
 
+        # 新增：保存配置按钮
+        ttk.Button(right_btn_frame, text="保存配置",
+                   command=self.save_config, width=12).pack(side=tk.RIGHT, padx=2)
+
         # 底部状态栏
         status_bar = ttk.Frame(main_container, height=25)
         status_bar.pack(fill=tk.X, pady=(10, 0))
@@ -295,8 +444,37 @@ class APISRVideoProcessor:
                                   background=self.bg_color)
         self.gpu_label.pack(side=tk.RIGHT, padx=10)
 
-        # 配置初始模型
-        self.on_model_change()
+    def setup_config_save_bindings(self):
+        """设置配置保存的事件绑定"""
+        # 为所有重要变量添加trace，当值改变时自动保存配置
+        variables_to_trace = [
+            (self.model_var, 'w'),
+            (self.scale_var, 'w'),
+            (self.segment_duration, 'w'),
+            (self.downsample_threshold, 'w'),
+            (self.batch_size_var, 'w'),
+            (self.tile_size_var, 'w'),
+            (self.hash_threshold_var, 'w'),
+            (self.ssim_threshold_var, 'w'),
+            (self.history_size_var, 'w'),
+        ]
+
+        for var, mode in variables_to_trace:
+            var.trace(mode, lambda *args: self.save_config())
+
+        # 为BooleanVar添加回调
+        boolean_vars = [
+            self.float16_var,
+            self.crop_for_4x_var,
+            self.enable_dup_detect_var,
+            self.use_ssim_var,
+            self.use_hash_var,
+            self.test_mode_var,
+            self.enable_history_var,
+        ]
+
+        for var in boolean_vars:
+            var.trace('w', lambda *args: self.save_config())
 
     def setup_left_panel(self, parent):
         """设置左侧参数面板"""
@@ -414,14 +592,44 @@ class APISRVideoProcessor:
                   width=8, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(ssim_frame, text="(0.9-1.0)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
-        # 历史帧数量（新增）
-        ttk.Label(dup_frame, text="历史帧数量:").grid(row=4, column=0, sticky=tk.W, pady=2)
-        history_frame = ttk.Frame(dup_frame)
-        history_frame.grid(row=4, column=1, sticky=tk.W, pady=2)
-        history_slider = ttk.Scale(history_frame, from_=5, to=100, orient=tk.HORIZONTAL,
-                                   variable=self.history_size_var, length=120)
-        history_slider.pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Label(history_frame, textvariable=self.history_size_var, width=3).pack(side=tk.LEFT)
+        # 历史帧设置（新增：包含开关）
+        ttk.Label(dup_frame, text="历史帧设置:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        history_setting_frame = ttk.Frame(dup_frame)
+        history_setting_frame.grid(row=4, column=1, sticky=tk.W, pady=2)
+
+        # 历史帧开关
+        self.history_check = ttk.Checkbutton(history_setting_frame, text="启用",
+                                             variable=self.enable_history_var,
+                                             command=self.toggle_history_settings)
+        self.history_check.pack(side=tk.LEFT, padx=(0, 10))
+
+        # 历史帧数量输入框
+        history_size_frame = ttk.Frame(history_setting_frame)
+        history_size_frame.pack(side=tk.LEFT)
+
+        ttk.Label(history_size_frame, text="数量:").pack(side=tk.LEFT, padx=(0, 5))
+
+        # 创建验证函数，确保只能输入整数
+        def validate_integer_input(action, value_if_allowed):
+            if action == '1':  # 插入操作
+                if value_if_allowed == '':
+                    return True
+                try:
+                    int(value_if_allowed)
+                    return True
+                except ValueError:
+                    return False
+            return True
+
+        # 创建历史帧数量输入框
+        vcmd = (self.root.register(validate_integer_input), '%d', '%P')
+        self.history_entry = ttk.Entry(history_size_frame, textvariable=self.history_size_var,
+                                       width=6, font=('Segoe UI', 9),
+                                       validate='key', validatecommand=vcmd,
+                                       state='normal' if self.enable_history_var.get() else 'disabled')
+        self.history_entry.pack(side=tk.LEFT, padx=(0, 5))
+
+        ttk.Label(history_size_frame, text="(1-100)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
         col = 2
 
@@ -451,6 +659,10 @@ class APISRVideoProcessor:
 4. 每个片段的帧文件在片段处理完成后自动清理
 5. 重复帧检测：哈希检测适合完全相同帧，SSIM检测适合结构相似帧
 6. 增强版：每帧会与最近N帧（可配置）进行对比，检测更准确
+7. 历史帧开关：关闭时只与前一帧对比，开启时可设置历史帧数量
+8. 重复帧计数：每次开始处理都会重置，无论是否继续先前任务
+9. 配置自动保存：所有设置会自动保存到配置文件中
+10. 详细日志：每帧的比对结果都会在日志中显示
 """
 
         info_label = tk.Label(info_frame, text=info_text,
@@ -470,6 +682,15 @@ class APISRVideoProcessor:
                                      bg='#2c3e50', fg='white',
                                      insertbackground='white')
         self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def toggle_history_settings(self):
+        """切换历史帧设置的状态"""
+        if self.enable_history_var.get():
+            self.history_entry.config(state='normal')
+            self.log("历史帧功能已启用")
+        else:
+            self.history_entry.config(state='disabled')
+            self.log("历史帧功能已禁用")
 
     def get_gpu_info(self):
         """获取GPU信息"""
@@ -571,7 +792,8 @@ class APISRVideoProcessor:
                     self.use_ssim_var.set(progress_data.get('use_ssim', True))
                     self.ssim_threshold_var.set(str(progress_data.get('ssim_threshold', 0.98)))
                     self.test_mode_var.set(progress_data.get('test_mode', False))
-                    self.history_size_var.set(str(progress_data.get('history_size', 40)))
+                    self.enable_history_var.set(progress_data.get('enable_history', True))  # 新增
+                    self.history_size_var.set(str(progress_data.get('history_size', 20)))
 
                     self.current_segment_index = progress_data.get('current_segment_index', 0)
                     self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
@@ -579,12 +801,12 @@ class APISRVideoProcessor:
                     self.segments = progress_data.get('segments', [])
                     self.processed_segments = progress_data.get('processed_segments', [])
                     self.temp_base_dir = progress_data.get('temp_base_dir')
-                    self.dup_frame_count = progress_data.get('dup_frame_count', 0)
+                    # 注意：不恢复dup_frame_count，每次开始处理都会重置
 
                     self.progress_data_file = progress_file
                     self.log(
                         f"已加载未完成的任务，当前进度：片段 {self.current_segment_index + 1}/{self.total_segments} 的第 {self.current_frame_in_segment + 1} 帧")
-                    self.update_dup_info(self.dup_frame_count)
+                    self.update_dup_info(0)  # 重置重复帧计数
 
                     # 设置视频基础名称
                     if self.input_path.get():
@@ -682,6 +904,11 @@ class APISRVideoProcessor:
 
     def log(self, message):
         """添加日志"""
+        if not hasattr(self, 'log_text'):
+            # 如果log_text还不存在，先打印到控制台
+            print(f"[初始化] {message}")
+            return
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
@@ -751,6 +978,7 @@ class APISRVideoProcessor:
             'use_hash': self.use_hash_var.get(),
             'use_ssim': self.use_ssim_var.get(),
             'test_mode': self.test_mode_var.get(),
+            'enable_history': self.enable_history_var.get(),  # 新增
             'history_size': int(self.history_size_var.get()),
             'current_segment_index': self.current_segment_index,
             'current_frame_in_segment': self.current_frame_in_segment,
@@ -1030,6 +1258,8 @@ class APISRVideoProcessor:
         # 从最近帧开始检查（时间上越接近越可能重复）
         best_match_idx = -1
         best_match_reason = ""
+        best_hash_diff = None
+        best_ssim_value = None
 
         # 遍历历史帧（从最近的开始）
         for i, (hist_frame, hist_hash, hist_thumbnail, hist_sr_result, hist_frame_idx) in enumerate(
@@ -1052,11 +1282,14 @@ class APISRVideoProcessor:
                         if ssim_value >= ssim_threshold:
                             best_match_idx = i
                             best_match_reason = f"哈希({hash_diff})和SSIM({ssim_value:.3f})匹配"
+                            best_hash_diff = hash_diff
+                            best_ssim_value = ssim_value
                             break
                     else:
                         # 只使用哈希检测
                         best_match_idx = i
                         best_match_reason = f"哈希匹配(差异:{hash_diff})"
+                        best_hash_diff = hash_diff
                         break
             # 如果只使用SSIM检测
             elif self.use_ssim_var.get() and current_thumbnail is not None and hist_thumbnail is not None:
@@ -1064,17 +1297,26 @@ class APISRVideoProcessor:
                 if ssim_value >= ssim_threshold:
                     best_match_idx = i
                     best_match_reason = f"SSIM匹配({ssim_value:.3f})"
+                    best_ssim_value = ssim_value
                     break
 
         if best_match_idx >= 0:
             # 找到匹配的帧
             matched_sr_result = self.frame_sr_history[best_match_idx]
+            matched_frame_idx = self.frame_idx_history[best_match_idx]
+
+            # 详细日志输出
+            history_size = len(self.frame_history)
+            log_message = f"帧 {frame_idx:04d}: 与历史帧 {matched_frame_idx:04d} 匹配"
+            if best_hash_diff is not None:
+                log_message += f", 哈希差异: {best_hash_diff}"
+            if best_ssim_value is not None:
+                log_message += f", SSIM: {best_ssim_value:.4f}"
+            log_message += f", 历史缓存: {history_size} 帧"
+            self.log(log_message)
+
             self.dup_frame_count += 1
             self.update_dup_info(self.dup_frame_count)
-
-            # 记录匹配信息
-            matched_frame_idx = self.frame_idx_history[best_match_idx]
-            self.log(f"帧 {frame_idx} 与帧 {matched_frame_idx} 重复: {best_match_reason}")
 
             # 更新历史帧信息（将匹配帧移到最近位置）
             if best_match_idx > 0:  # 如果不是已经在最前面
@@ -1104,6 +1346,16 @@ class APISRVideoProcessor:
                 self.frame_idx_history.appendleft(items_to_move[4])
 
             return True, matched_sr_result.copy(), current_hash, current_thumbnail
+
+        # 如果没有找到匹配帧，也输出日志
+        else:
+            history_size = len(self.frame_history)
+            log_message = f"帧 {frame_idx:04d}: 未发现重复"
+            if self.enable_history_var.get():
+                log_message += f", 已检查 {history_size} 个历史帧"
+            else:
+                log_message += ", 历史帧功能已禁用"
+            self.log(log_message)
 
         return False, None, current_hash, current_thumbnail
 
@@ -1351,7 +1603,7 @@ class APISRVideoProcessor:
         # 初始化历史帧缓存
         self.init_history_cache()
 
-        # 更新重复帧计数
+        # 更新重复帧计数（已重置为0）
         self.update_dup_info(self.dup_frame_count)
 
         # 为当前片段创建帧目录
@@ -1406,7 +1658,12 @@ class APISRVideoProcessor:
                 methods.append(f"哈希(阈值:{self.hash_threshold_var.get()})")
             if self.use_ssim_var.get():
                 methods.append(f"SSIM(阈值:{self.ssim_threshold_var.get()})")
-            self.log(f"重复帧检测: {', '.join(methods)}，历史帧数量: {self.history_size_var.get()}")
+
+            if self.enable_history_var.get():
+                history_size = int(self.history_size_var.get())
+                self.log(f"重复帧检测: {', '.join(methods)}，历史帧功能: 启用(数量:{history_size})")
+            else:
+                self.log(f"重复帧检测: {', '.join(methods)}，历史帧功能: 禁用")
 
         # 如果从进度恢复，跳过已处理的帧
         start_frame = self.current_frame_in_segment
@@ -1425,7 +1682,10 @@ class APISRVideoProcessor:
             dup_file.write(f"SSIM阈值: {self.ssim_threshold_var.get()}\n")
             dup_file.write(f"哈希检测: {'启用' if self.use_hash_var.get() else '禁用'}\n")
             dup_file.write(f"SSIM检测: {'启用' if self.use_ssim_var.get() else '禁用'}\n")
-            dup_file.write(f"历史帧数量: {self.history_size_var.get()}\n")
+            dup_file.write(f"历史帧功能: {'启用' if self.enable_history_var.get() else '禁用'}\n")
+            if self.enable_history_var.get():
+                history_size = int(self.history_size_var.get())
+                dup_file.write(f"历史帧数量: {history_size}\n")
             dup_file.write("=" * 50 + "\n")
             dup_file.write("帧号\t是否重复\t匹配帧号\t匹配原因\n")
 
@@ -1658,6 +1918,7 @@ class APISRVideoProcessor:
             try:
                 hash_threshold = int(self.hash_threshold_var.get())
                 ssim_threshold = float(self.ssim_threshold_var.get())
+                history_size = int(self.history_size_var.get())
 
                 if hash_threshold < 0 or hash_threshold > 10:
                     messagebox.showwarning("警告", "哈希相似度阈值必须在0-10之间")
@@ -1667,6 +1928,11 @@ class APISRVideoProcessor:
                 if ssim_threshold < 0.9 or ssim_threshold > 1.0:
                     messagebox.showwarning("警告", "SSIM阈值必须在0.9-1.0之间")
                     self.ssim_threshold_var.set("0.98")
+                    return
+
+                if history_size < 1 or history_size > 100:
+                    messagebox.showwarning("警告", "历史帧数量必须在1-100之间")
+                    self.history_size_var.set("20")
                     return
             except ValueError:
                 messagebox.showerror("错误", "参数格式错误")
@@ -1684,6 +1950,10 @@ class APISRVideoProcessor:
 
             if self.test_mode_var.get():
                 self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
+
+            # 重置重复帧计数（无论是否继续任务都重置）
+            self.dup_frame_count = 0
+            self.update_dup_info(self.dup_frame_count)
 
             # 更新状态
             self.processing = True
@@ -1708,11 +1978,11 @@ class APISRVideoProcessor:
                     self.total_segments = progress_data.get('total_segments', 0)
                     self.segments = progress_data.get('segments', [])
                     self.processed_segments = progress_data.get('processed_segments', [])
-                    self.dup_frame_count = progress_data.get('dup_frame_count', 0)
+                    # 注意：不恢复dup_frame_count，已重置为0
 
                     self.log(
                         f"恢复进度: 片段 {self.current_segment_index + 1}/{self.total_segments} 的第 {self.current_frame_in_segment + 1} 帧")
-                    self.update_dup_info(self.dup_frame_count)
+                    self.log(f"重复帧计数已重置")
                 except Exception as e:
                     self.log(f"加载进度数据时出错: {e}")
                     self.current_segment_index = 0
@@ -1944,6 +2214,9 @@ class APISRVideoProcessor:
                 del self.generator
                 torch.cuda.empty_cache()
 
+            # 保存配置
+            self.save_config()
+
     def start_processing(self):
         """开始处理"""
         if self.processing:
@@ -1954,6 +2227,7 @@ class APISRVideoProcessor:
             scale = int(self.scale_var.get())
             model = self.model_var.get()
             batch_size = int(self.batch_size_var.get())
+            history_size = int(self.history_size_var.get())
 
             if model in ["GRL", "DAT"] and scale != 4:
                 messagebox.showwarning("警告", f"{model}模型只支持4倍缩放")
@@ -1967,6 +2241,11 @@ class APISRVideoProcessor:
             if batch_size < 1 or batch_size > 2:
                 messagebox.showwarning("警告", "6GB GPU批处理大小建议为1-2")
                 self.batch_size_var.set("1")
+                return
+
+            if history_size < 1 or history_size > 100:
+                messagebox.showwarning("警告", "历史帧数量必须在1-100之间")
+                self.history_size_var.set("20")
                 return
         except ValueError:
             messagebox.showerror("错误", "参数格式错误")
@@ -2096,6 +2375,9 @@ class APISRVideoProcessor:
 
     def on_closing(self):
         """关闭窗口时的清理"""
+        # 保存配置
+        self.save_config()
+
         if self.processing:
             response = messagebox.askyesnocancel("退出",
                                                  "处理仍在进行中，您可以选择:\n\n"

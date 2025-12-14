@@ -71,7 +71,7 @@ class APISRVideoProcessor:
         self.config_file = "apisr_config.json"
 
         # 初始化变量
-        self.input_path = tk.StringVar()
+        self.input_paths = []  # 改为存储多个视频路径的列表
         self.output_dir = tk.StringVar()
         self.model_var = tk.StringVar(value="GRL")
         self.scale_var = tk.StringVar(value="4")
@@ -87,7 +87,7 @@ class APISRVideoProcessor:
         self.use_ssim_var = tk.BooleanVar(value=True)
         self.use_hash_var = tk.BooleanVar(value=True)
         self.test_mode_var = tk.BooleanVar(value=False)
-        self.enable_history_var = tk.BooleanVar(value=True)  # 新增：历史帧开关
+        self.enable_history_var = tk.BooleanVar(value=True)
         self.history_size_var = tk.StringVar(value="20")
 
         # 设置样式
@@ -112,6 +112,7 @@ class APISRVideoProcessor:
         self.weight_dtype = torch.float32
 
         # 进度恢复相关
+        self.current_video_index = 0  # 新增：当前处理视频索引
         self.current_segment_index = 0
         self.current_frame_in_segment = 0
         self.total_segments = 0
@@ -141,7 +142,7 @@ class APISRVideoProcessor:
         # 新增：暂停时的内存优化
         self.pause_lock = threading.Lock()
         self.pause_cv = threading.Condition(self.pause_lock)
-        self.should_sleep = False  # 用于控制暂停时是否让线程休眠
+        self.should_sleep = False
 
         # 设置历史帧数量验证
         self.setup_history_size_validation()
@@ -321,35 +322,35 @@ class APISRVideoProcessor:
         """设置UI布局"""
         # 主容器
         main_container = ttk.Frame(self.root)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         # 标题
         title_frame = ttk.Frame(main_container)
-        title_frame.pack(fill=tk.X, pady=(0, 15))
+        title_frame.pack(fill=tk.X, pady=(0, 10))
 
         title_label = tk.Label(title_frame, text="APISR 视频超分辨率处理工具",
-                               font=('Segoe UI', 20, 'bold'),
+                               font=('Segoe UI', 18, 'bold'),
                                foreground=self.sidebar_color,
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v1.7",  # 更新版本号
+        version_label = tk.Label(title_frame, text="v1.8",  # 更新版本号
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
         version_label.pack(side=tk.RIGHT)
 
-        # 主内容区域
-        content_frame = ttk.Frame(main_container)
-        content_frame.pack(fill=tk.BOTH, expand=True)
+        # 主内容区域 - 使用PanedWindow实现可调整大小的分割
+        paned_window = tk.PanedWindow(main_container, orient=tk.HORIZONTAL, sashwidth=8, sashrelief=tk.RAISED)
+        paned_window.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         # 左侧参数面板
-        left_frame = ttk.Frame(content_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 15))
+        left_frame = ttk.Frame(paned_window)
+        paned_window.add(left_frame, width=500, minsize=400)
 
         # 右侧日志面板
-        right_frame = ttk.Frame(content_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        right_frame = ttk.Frame(paned_window)
+        paned_window.add(right_frame, width=600, minsize=400)
 
         # 设置面板
         self.setup_left_panel(left_frame)
@@ -357,11 +358,11 @@ class APISRVideoProcessor:
 
         # 进度条区域
         progress_frame = ttk.Frame(main_container)
-        progress_frame.pack(fill=tk.X, pady=(10, 0))
+        progress_frame.pack(fill=tk.X, pady=(0, 5))
 
         # 进度信息
         progress_info_frame = ttk.Frame(progress_frame)
-        progress_info_frame.pack(fill=tk.X, pady=(0, 5))
+        progress_info_frame.pack(fill=tk.X, pady=(0, 3))
 
         self.progress_info = ttk.Label(progress_info_frame, text="准备开始处理",
                                        font=('Segoe UI', 10, 'bold'),
@@ -382,7 +383,7 @@ class APISRVideoProcessor:
 
         # 控制按钮区域
         control_frame = ttk.Frame(main_container)
-        control_frame.pack(fill=tk.X, pady=(10, 0))
+        control_frame.pack(fill=tk.X, pady=(5, 5))
 
         # 左侧按钮组
         left_btn_frame = ttk.Frame(control_frame)
@@ -428,8 +429,8 @@ class APISRVideoProcessor:
                    command=self.save_config, width=12).pack(side=tk.RIGHT, padx=2)
 
         # 底部状态栏
-        status_bar = ttk.Frame(main_container, height=25)
-        status_bar.pack(fill=tk.X, pady=(10, 0))
+        status_bar = ttk.Frame(main_container, height=20)
+        status_bar.pack(fill=tk.X, pady=(5, 0))
 
         self.status_label = tk.Label(status_bar, text="准备就绪",
                                      font=('Segoe UI', 9),
@@ -480,89 +481,100 @@ class APISRVideoProcessor:
         """设置左侧参数面板"""
         # 创建主框架
         main_frame = ttk.Frame(parent)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # 使用网格布局，3行3列
-        for i in range(3):
-            main_frame.grid_rowconfigure(i, weight=1, pad=5)
+        # 使用grid布局，4行2列
+        for i in range(4):
+            main_frame.grid_rowconfigure(i, weight=1, pad=2)
+        for i in range(2):
             main_frame.grid_columnconfigure(i, weight=1, pad=5)
 
         row = 0
-        col = 0
 
-        # 1. 文件设置部分
-        file_frame = ttk.LabelFrame(main_frame, text="文件设置", padding=10)
-        file_frame.grid(row=row, column=col, sticky="nsew", padx=(0, 5), pady=(0, 5))
+        # 1. 文件设置部分 - 占用一行两列
+        file_frame = ttk.LabelFrame(main_frame, text="文件设置", padding=8)
+        file_frame.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=2, pady=2)
+        file_frame.grid_columnconfigure(1, weight=1)
 
-        # 输入文件
-        ttk.Label(file_frame, text="输入视频:", font=('Segoe UI', 9)).pack(anchor=tk.W, pady=(0, 2))
-        input_frame = ttk.Frame(file_frame)
-        input_frame.pack(fill=tk.X, pady=(0, 8))
-        input_entry = ttk.Entry(input_frame, textvariable=self.input_path, font=('Segoe UI', 9))
-        input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(input_frame, text="浏览", command=self.select_input_file, width=6).pack(side=tk.RIGHT)
+        # 输入文件 - 紧凑布局
+        ttk.Label(file_frame, text="输入视频:", font=('Segoe UI', 9)).grid(row=0, column=0, sticky=tk.W, pady=(0, 2))
 
-        # 输出目录
-        ttk.Label(file_frame, text="输出目录:", font=('Segoe UI', 9)).pack(anchor=tk.W, pady=(0, 2))
-        output_frame = ttk.Frame(file_frame)
-        output_frame.pack(fill=tk.X)
-        output_entry = ttk.Entry(output_frame, textvariable=self.output_dir, font=('Segoe UI', 9))
-        output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(output_frame, text="浏览", command=self.select_output_dir, width=6).pack(side=tk.RIGHT)
+        input_btn_frame = ttk.Frame(file_frame)
+        input_btn_frame.grid(row=0, column=1, sticky=tk.W, pady=(0, 2))
 
-        col += 1
+        ttk.Button(input_btn_frame, text="选择视频文件",
+                   command=self.select_input_files, width=18).pack(side=tk.LEFT)
 
-        # 2. 模型参数部分
-        model_frame = ttk.LabelFrame(main_frame, text="模型参数", padding=10)
-        model_frame.grid(row=row, column=col, sticky="nsew", padx=5, pady=(0, 5))
+        # 创建标签显示选择的视频数量
+        self.input_info_label = tk.Label(input_btn_frame, text="未选择视频",
+                                         font=('Segoe UI', 8),
+                                         foreground='#7f8c8d',
+                                         background=self.bg_color)
+        self.input_info_label.pack(side=tk.LEFT, padx=(10, 0))
 
-        # 模型选择
-        ttk.Label(model_frame, text="选择模型:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
-                                   values=list(self.models.keys()),
-                                   state="readonly", width=15, font=('Segoe UI', 9))
-        model_combo.grid(row=0, column=1, sticky=tk.W, pady=2, padx=(5, 0))
-        model_combo.bind('<<ComboboxSelected>>', self.on_model_change)
+        # 输出目录 - 紧凑布局
+        ttk.Label(file_frame, text="输出目录:", font=('Segoe UI', 9)).grid(row=1, column=0, sticky=tk.W, pady=(2, 0))
 
-        # 缩放因子
-        ttk.Label(model_frame, text="缩放因子:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.scale_combo = ttk.Combobox(model_frame, textvariable=self.scale_var,
-                                        state="readonly", width=15, font=('Segoe UI', 9))
-        self.scale_combo.grid(row=1, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        output_entry_frame = ttk.Frame(file_frame)
+        output_entry_frame.grid(row=1, column=1, sticky=tk.EW, pady=(2, 0))
+        output_entry_frame.grid_columnconfigure(0, weight=1)
 
-        # 分段时长
-        ttk.Label(model_frame, text="分段时长(秒):").grid(row=2, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(model_frame, textvariable=self.segment_duration,
-                  width=15, font=('Segoe UI', 9)).grid(row=2, column=1, sticky=tk.W, pady=2, padx=(5, 0))
-
-        # 下采样阈值
-        ttk.Label(model_frame, text="下采样阈值:").grid(row=3, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(model_frame, textvariable=self.downsample_threshold,
-                  width=15, font=('Segoe UI', 9)).grid(row=3, column=1, sticky=tk.W, pady=2, padx=(5, 0))
-
-        col += 1
-
-        # 3. 性能设置部分
-        perf_frame = ttk.LabelFrame(main_frame, text="性能设置", padding=10)
-        perf_frame.grid(row=row, column=col, sticky="nsew", padx=(5, 0), pady=(0, 5))
-
-        # 批处理大小
-        ttk.Label(perf_frame, text="批处理大小:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(perf_frame, textvariable=self.batch_size_var,
-                  width=12, font=('Segoe UI', 9)).grid(row=0, column=1, sticky=tk.W, pady=2, padx=(5, 0))
-
-        # 瓦片大小
-        ttk.Label(perf_frame, text="瓦片大小:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        ttk.Entry(perf_frame, textvariable=self.tile_size_var,
-                  width=12, font=('Segoe UI', 9)).grid(row=1, column=1, sticky=tk.W, pady=2, padx=(5, 0))
+        output_entry = ttk.Entry(output_entry_frame, textvariable=self.output_dir, font=('Segoe UI', 9))
+        output_entry.grid(row=0, column=0, sticky=tk.EW, padx=(0, 5))
+        ttk.Button(output_entry_frame, text="浏览", command=self.select_output_dir, width=8).grid(row=0, column=1)
 
         row += 1
-        col = 0
 
-        # 4. 重复帧检测部分
-        dup_frame = ttk.LabelFrame(main_frame, text="重复帧检测设置", padding=10)
-        dup_frame.grid(row=row, column=col, columnspan=2, sticky="nsew", padx=(0, 5), pady=5)
-        dup_frame.grid_columnconfigure(1, weight=1)
+        # 2. 模型参数部分
+        model_frame = ttk.LabelFrame(main_frame, text="模型参数", padding=8)
+        model_frame.grid(row=row, column=0, sticky="nsew", padx=2, pady=2)
+
+        # 使用grid布局内部控件
+        ttk.Label(model_frame, text="选择模型:").grid(row=0, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        model_combo = ttk.Combobox(model_frame, textvariable=self.model_var,
+                                   values=list(self.models.keys()),
+                                   state="readonly", width=12, font=('Segoe UI', 9))
+        model_combo.grid(row=0, column=1, sticky=tk.W, pady=2)
+        model_combo.bind('<<ComboboxSelected>>', self.on_model_change)
+
+        ttk.Label(model_frame, text="缩放因子:").grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        self.scale_combo = ttk.Combobox(model_frame, textvariable=self.scale_var,
+                                        state="readonly", width=12, font=('Segoe UI', 9))
+        self.scale_combo.grid(row=1, column=1, sticky=tk.W, pady=2)
+
+        ttk.Label(model_frame, text="分段时长(秒):").grid(row=2, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Entry(model_frame, textvariable=self.segment_duration,
+                  width=12, font=('Segoe UI', 9)).grid(row=2, column=1, sticky=tk.W, pady=2)
+
+        ttk.Label(model_frame, text="下采样阈值:").grid(row=3, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Entry(model_frame, textvariable=self.downsample_threshold,
+                  width=12, font=('Segoe UI', 9)).grid(row=3, column=1, sticky=tk.W, pady=2)
+
+        # 3. 性能设置部分
+        perf_frame = ttk.LabelFrame(main_frame, text="性能设置", padding=8)
+        perf_frame.grid(row=row, column=1, sticky="nsew", padx=2, pady=2)
+
+        ttk.Label(perf_frame, text="批处理大小:").grid(row=0, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Entry(perf_frame, textvariable=self.batch_size_var,
+                  width=10, font=('Segoe UI', 9)).grid(row=0, column=1, sticky=tk.W, pady=2)
+
+        ttk.Label(perf_frame, text="瓦片大小:").grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Entry(perf_frame, textvariable=self.tile_size_var,
+                  width=10, font=('Segoe UI', 9)).grid(row=1, column=1, sticky=tk.W, pady=2)
+
+        ttk.Label(perf_frame, text="数据类型:").grid(row=2, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Checkbutton(perf_frame, text="FP16加速",
+                        variable=self.float16_var).grid(row=2, column=1, sticky=tk.W, pady=2)
+
+        ttk.Label(perf_frame, text="边缘处理:").grid(row=3, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Checkbutton(perf_frame, text="4倍缩放时裁剪",
+                        variable=self.crop_for_4x_var).grid(row=3, column=1, sticky=tk.W, pady=2)
+
+        row += 1
+
+        # 4. 重复帧检测部分 - 占用一行两列
+        dup_frame = ttk.LabelFrame(main_frame, text="重复帧检测设置", padding=8)
+        dup_frame.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=2, pady=2)
 
         # 启用检测
         ttk.Checkbutton(dup_frame, text="启用重复帧检测",
@@ -572,9 +584,9 @@ class APISRVideoProcessor:
         method_frame = ttk.Frame(dup_frame)
         method_frame.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=2)
         ttk.Checkbutton(method_frame, text="哈希检测",
-                        variable=self.use_hash_var).pack(side=tk.LEFT, padx=(0, 10))
+                        variable=self.use_hash_var, width=10).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Checkbutton(method_frame, text="SSIM检测",
-                        variable=self.use_ssim_var).pack(side=tk.LEFT)
+                        variable=self.use_ssim_var, width=10).pack(side=tk.LEFT)
 
         # 哈希阈值
         ttk.Label(dup_frame, text="哈希阈值:").grid(row=2, column=0, sticky=tk.W, pady=2)
@@ -592,7 +604,7 @@ class APISRVideoProcessor:
                   width=8, font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(ssim_frame, text="(0.9-1.0)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
-        # 历史帧设置（新增：包含开关）
+        # 历史帧设置
         ttk.Label(dup_frame, text="历史帧设置:").grid(row=4, column=0, sticky=tk.W, pady=2)
         history_setting_frame = ttk.Frame(dup_frame)
         history_setting_frame.grid(row=4, column=1, sticky=tk.W, pady=2)
@@ -631,39 +643,33 @@ class APISRVideoProcessor:
 
         ttk.Label(history_size_frame, text="(1-100)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
-        col = 2
+        row += 1
 
-        # 5. 处理选项部分
-        options_frame = ttk.LabelFrame(main_frame, text="处理选项", padding=10)
-        options_frame.grid(row=row, column=col, sticky="nsew", padx=(5, 0), pady=5)
+        # 5. 其他选项和说明信息部分
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.grid(row=row, column=0, columnspan=2, sticky="nsew", pady=(2, 0))
+        bottom_frame.grid_columnconfigure(0, weight=1)
+        bottom_frame.grid_columnconfigure(1, weight=1)
 
-        ttk.Checkbutton(options_frame, text="使用FP16推理",
-                        variable=self.float16_var).pack(anchor=tk.W, pady=2)
-
-        ttk.Checkbutton(options_frame, text="为4倍缩放裁剪边缘",
-                        variable=self.crop_for_4x_var).pack(anchor=tk.W, pady=2)
+        # 处理选项部分
+        options_frame = ttk.LabelFrame(bottom_frame, text="处理选项", padding=8)
+        options_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=0)
 
         ttk.Checkbutton(options_frame, text="测试模式(仅重复帧检测)",
                         variable=self.test_mode_var).pack(anchor=tk.W, pady=2)
 
-        row += 1
+        ttk.Checkbutton(options_frame, text="启用配置自动保存",
+                        command=self.save_config).pack(anchor=tk.W, pady=2)
 
-        # 6. 说明信息部分
-        info_frame = ttk.LabelFrame(main_frame, text="说明", padding=10)
-        info_frame.grid(row=row, column=0, columnspan=3, sticky="nsew", pady=(5, 0))
+        # 说明信息部分
+        info_frame = ttk.LabelFrame(bottom_frame, text="说明", padding=8)
+        info_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
 
-        info_text = """
-1. 暂停/继续：使用同一按钮切换，暂停时自动保存进度
-2. 停止：可选择是否保存进度，保存后可恢复
-3. 临时文件夹以视频文件名命名，便于管理
-4. 每个片段的帧文件在片段处理完成后自动清理
-5. 重复帧检测：哈希检测适合完全相同帧，SSIM检测适合结构相似帧
-6. 增强版：每帧会与最近N帧（可配置）进行对比，检测更准确
-7. 历史帧开关：关闭时只与前一帧对比，开启时可设置历史帧数量
-8. 重复帧计数：每次开始处理都会重置，无论是否继续先前任务
-9. 配置自动保存：所有设置会自动保存到配置文件中
-10. 详细日志：每帧的比对结果都会在日志中显示
-"""
+        info_text = """1. 支持批量处理多个视频
+2. 暂停时可保存进度
+3. 重复帧检测可加速处理
+4. 历史帧数量可配置
+5. 配置自动保存"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -674,7 +680,7 @@ class APISRVideoProcessor:
 
     def setup_right_panel(self, parent):
         """设置右侧日志面板"""
-        log_frame = ttk.LabelFrame(parent, text="处理日志", padding=10)
+        log_frame = ttk.LabelFrame(parent, text="处理日志", padding=8)
         log_frame.pack(fill=tk.BOTH, expand=True)
 
         self.log_text = ScrolledText(log_frame, height=28, width=60,
@@ -711,35 +717,42 @@ class APISRVideoProcessor:
             else:
                 self.scale_var.set(str(scales[0]))
 
-    def select_input_file(self):
-        """选择输入视频文件"""
-        filename = filedialog.askopenfilename(
+    def select_input_files(self):
+        """选择多个输入视频文件"""
+        filenames = filedialog.askopenfilenames(
             title="选择视频文件",
             filetypes=[
                 ("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
                 ("所有文件", "*.*")
             ]
         )
-        if filename:
-            self.input_path.set(filename)
-            # 设置视频基础名称
-            self.video_base_name = Path(filename).stem
 
-            # 自动设置输出目录
+        if filenames:
+            # 按文件名排序
+            self.input_paths = sorted(list(filenames))
+
+            # 更新显示信息
+            if len(self.input_paths) == 1:
+                file_name = os.path.basename(self.input_paths[0])
+                if len(file_name) > 20:
+                    file_name = file_name[:17] + "..."
+                self.input_info_label.config(text=f"已选择: {file_name}")
+            else:
+                self.input_info_label.config(text=f"已选择 {len(self.input_paths)} 个视频")
+                self.log(f"已选择 {len(self.input_paths)} 个视频文件，将按以下顺序处理:")
+                for i, path in enumerate(self.input_paths):
+                    self.log(f"  {i + 1}. {os.path.basename(path)}")
+
+            # 自动设置输出目录（以第一个视频的目录为准）
             if not self.output_dir.get():
-                output_path = Path(filename).parent / "APISR_Output"
+                output_path = Path(self.input_paths[0]).parent / "APISR_Output"
                 self.output_dir.set(str(output_path))
-
-            # 检查恢复进度
-            self.check_and_recover_progress()
 
     def select_output_dir(self):
         """选择输出目录"""
         directory = filedialog.askdirectory(title="选择输出目录")
         if directory:
             self.output_dir.set(directory)
-            # 检查恢复进度
-            self.check_and_recover_progress()
 
     def open_output_dir(self):
         """打开输出目录"""
@@ -755,78 +768,17 @@ class APISRVideoProcessor:
             except Exception as e:
                 self.log(f"打开目录失败: {e}")
 
-    def check_and_recover_progress(self):
-        """检查并恢复未完成的任务"""
-        if not self.output_dir.get() or not self.input_path.get():
-            return
-
-        # 基于视频文件名生成临时文件夹名
-        video_name = Path(self.input_path.get()).stem
-        temp_dir_name = f"{video_name}_temp"
-        progress_file = os.path.join(self.output_dir.get(), temp_dir_name, "progress_data.pkl")
-
-        # 检查是否有进度文件
-        if os.path.exists(progress_file):
-            try:
-                with open(progress_file, 'rb') as f:
-                    progress_data = pickle.load(f)
-
-                response = messagebox.askyesnocancel("发现未完成的任务",
-                                                     f"发现未完成的任务。是否恢复上次的任务？\n\n"
-                                                     f"输入文件: {progress_data.get('input_path', '未知')}\n"
-                                                     f"模型: {progress_data.get('model', '未知')}\n"
-                                                     f"缩放: {progress_data.get('scale', '未知')}x\n"
-                                                     f"进度: 片段 {progress_data.get('current_segment_index', 0) + 1}/{progress_data.get('total_segments', 0)} 的第 {progress_data.get('current_frame_in_segment', 0) + 1} 帧")
-
-                if response:
-                    # 恢复进度
-                    self.input_path.set(progress_data.get('input_path', ''))
-                    self.model_var.set(progress_data.get('model', 'GRL'))
-                    self.scale_var.set(str(progress_data.get('scale', 4)))
-                    self.downsample_threshold.set(str(progress_data.get('downsample_threshold', 720)))
-                    self.float16_var.set(progress_data.get('float16', False))
-                    self.crop_for_4x_var.set(progress_data.get('crop_for_4x', True))
-                    self.batch_size_var.set(str(progress_data.get('batch_size', 1)))
-                    self.hash_threshold_var.set(str(progress_data.get('hash_threshold', 3)))
-                    self.use_hash_var.set(progress_data.get('use_hash', True))
-                    self.use_ssim_var.set(progress_data.get('use_ssim', True))
-                    self.ssim_threshold_var.set(str(progress_data.get('ssim_threshold', 0.98)))
-                    self.test_mode_var.set(progress_data.get('test_mode', False))
-                    self.enable_history_var.set(progress_data.get('enable_history', True))  # 新增
-                    self.history_size_var.set(str(progress_data.get('history_size', 20)))
-
-                    self.current_segment_index = progress_data.get('current_segment_index', 0)
-                    self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
-                    self.total_segments = progress_data.get('total_segments', 0)
-                    self.segments = progress_data.get('segments', [])
-                    self.processed_segments = progress_data.get('processed_segments', [])
-                    self.temp_base_dir = progress_data.get('temp_base_dir')
-                    # 注意：不恢复dup_frame_count，每次开始处理都会重置
-
-                    self.progress_data_file = progress_file
-                    self.log(
-                        f"已加载未完成的任务，当前进度：片段 {self.current_segment_index + 1}/{self.total_segments} 的第 {self.current_frame_in_segment + 1} 帧")
-                    self.update_dup_info(0)  # 重置重复帧计数
-
-                    # 设置视频基础名称
-                    if self.input_path.get():
-                        self.video_base_name = Path(self.input_path.get()).stem
-
-                elif response is False:
-                    # 用户选择不恢复，删除进度文件
-                    self.cleanup_temp_files()
-                    self.log("已清理未完成的任务数据")
-            except Exception as e:
-                self.log(f"加载进度文件时出错: {e}")
-
-    def setup_temp_dirs(self):
+    def setup_temp_dirs(self, video_path):
         """设置临时目录结构 - 基于视频文件名"""
         output_dir = self.output_dir.get()
-        if not output_dir or not self.video_base_name:
+        if not output_dir:
             return None
 
+        # 获取视频基础名称
+        video_name = Path(video_path).stem
+
         # 基于视频文件名创建临时目录
-        temp_dir_name = f"{self.video_base_name}_temp"
+        temp_dir_name = f"{video_name}_temp"
         self.temp_base_dir = os.path.join(output_dir, temp_dir_name)
 
         # 创建标准化的目录结构
@@ -834,7 +786,7 @@ class APISRVideoProcessor:
             'base': self.temp_base_dir,
             'original_segments': os.path.join(self.temp_base_dir, "01_original_segments"),
             'audio': os.path.join(self.temp_base_dir, "02_audio"),
-            'segment_frames': os.path.join(self.temp_base_dir, "03_segment_frames"),
+            'segment_frames': os.path.join(self.temp_base_dir, "03_segment_frames"),  # 直接放置before/after文件夹
             'processed_segments': os.path.join(self.temp_base_dir, "04_processed_segments"),
             'logs': os.path.join(self.temp_base_dir, "05_logs")
         }
@@ -846,16 +798,13 @@ class APISRVideoProcessor:
         return dirs
 
     def setup_segment_frame_dirs(self, segment_index):
-        """为当前片段设置帧目录"""
+        """为当前片段设置帧目录 - 直接在03_segment_frames下创建文件夹"""
         if not self.temp_base_dir:
             return None, None
 
-        # 创建标准化的帧目录结构
-        segment_dir_name = f"segment_{segment_index:03d}"
-        segment_path = os.path.join(self.temp_base_dir, "03_segment_frames", segment_dir_name)
-
-        before_dir = os.path.join(segment_path, "before_frames")
-        after_dir = os.path.join(segment_path, "after_frames")
+        # 直接在03_segment_frames下创建带前后缀的文件夹
+        before_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_before")
+        after_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_after")
 
         os.makedirs(before_dir, exist_ok=True)
         os.makedirs(after_dir, exist_ok=True)
@@ -867,15 +816,17 @@ class APISRVideoProcessor:
         if not self.temp_base_dir:
             return
 
-        segment_dir_name = f"segment_{segment_index:03d}"
-        segment_path = os.path.join(self.temp_base_dir, "03_segment_frames", segment_dir_name)
+        # 清理before和after文件夹
+        before_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_before")
+        after_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_after")
 
-        if os.path.exists(segment_path):
-            try:
-                shutil.rmtree(segment_path)
-                self.log(f"已清理临时帧目录: segment_{segment_index:03d}")
-            except Exception as e:
-                self.log(f"清理临时帧目录时出错: {e}")
+        for dir_path in [before_dir, after_dir]:
+            if os.path.exists(dir_path):
+                try:
+                    shutil.rmtree(dir_path)
+                    self.log(f"已清理临时帧目录: {os.path.basename(dir_path)}")
+                except Exception as e:
+                    self.log(f"清理临时帧目录时出错: {e}")
 
     def cleanup_temp_files(self):
         """清理临时文件"""
@@ -933,7 +884,7 @@ class APISRVideoProcessor:
     def update_progress_info(self):
         """更新进度信息"""
         if self.total_segments > 0:
-            info = f"处理进度: 片段 {self.current_segment_index + 1}/{self.total_segments}"
+            info = f"视频 {self.current_video_index + 1}/{len(self.input_paths)} - 片段 {self.current_segment_index + 1}/{self.total_segments}"
             self.progress_info.config(text=info)
             self.root.update_idletasks()
 
@@ -965,8 +916,13 @@ class APISRVideoProcessor:
         if not force and current_time - self.last_save_time < self.save_interval:
             return
 
+        # 保存当前视频的进度
+        current_video_path = self.input_paths[self.current_video_index] if self.current_video_index < len(
+            self.input_paths) else ""
+
         progress_data = {
-            'input_path': self.input_path.get(),
+            'current_video_index': self.current_video_index,
+            'current_video_path': current_video_path,
             'model': self.model_var.get(),
             'scale': int(self.scale_var.get()),
             'downsample_threshold': int(self.downsample_threshold.get()),
@@ -978,7 +934,7 @@ class APISRVideoProcessor:
             'use_hash': self.use_hash_var.get(),
             'use_ssim': self.use_ssim_var.get(),
             'test_mode': self.test_mode_var.get(),
-            'enable_history': self.enable_history_var.get(),  # 新增
+            'enable_history': self.enable_history_var.get(),
             'history_size': int(self.history_size_var.get()),
             'current_segment_index': self.current_segment_index,
             'current_frame_in_segment': self.current_frame_in_segment,
@@ -998,7 +954,7 @@ class APISRVideoProcessor:
             self.last_save_time = current_time
             if force:
                 self.log(
-                    f"进度已保存: 片段 {self.current_segment_index + 1} 的第 {self.current_frame_in_segment + 1} 帧")
+                    f"进度已保存: 视频 {self.current_video_index + 1} - 片段 {self.current_segment_index + 1} 的第 {self.current_frame_in_segment + 1} 帧")
         except Exception as e:
             self.log(f"保存进度时出错: {e}")
 
@@ -1394,7 +1350,7 @@ class APISRVideoProcessor:
 
     def split_video_by_keyframes(self, video_path, segment_duration, output_dir):
         """按关键帧分割视频"""
-        self.log(f"开始分割视频: {video_path}")
+        self.log(f"开始分割视频: {os.path.basename(video_path)}")
 
         segments = []
 
@@ -1606,7 +1562,7 @@ class APISRVideoProcessor:
         # 更新重复帧计数（已重置为0）
         self.update_dup_info(self.dup_frame_count)
 
-        # 为当前片段创建帧目录
+        # 为当前片段创建帧目录（直接创建在03_segment_frames下）
         before_dir, after_dir = self.setup_segment_frame_dirs(segment_index)
 
         if not before_dir or not after_dir:
@@ -1734,7 +1690,7 @@ class APISRVideoProcessor:
             if not ret:
                 break
 
-            # 保存原始帧到before_frames目录
+            # 保存原始帧到before目录
             before_path = os.path.join(before_dir, f"frame_{frame_idx:06d}.png")
             cv2.imwrite(before_path, frame)
 
@@ -1742,7 +1698,7 @@ class APISRVideoProcessor:
             sr_frame, current_hash, current_thumbnail, is_duplicate = \
                 self.process_frame_with_enhanced_dup_detect(frame, frame_idx)
 
-            # 保存处理后的帧到after_frames目录
+            # 保存处理后的帧到after目录
             after_path = os.path.join(after_dir, f"frame_{frame_idx:06d}.png")
             sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
             cv2.imwrite(after_path, sr_frame_bgr)
@@ -1897,52 +1853,17 @@ class APISRVideoProcessor:
             if os.path.exists(list_file):
                 os.remove(list_file)
 
-    def process_video(self):
-        """主处理函数"""
+    def process_single_video(self, video_path):
+        """处理单个视频"""
         try:
-            # 检查输入
-            input_path = self.input_path.get()
-            if not input_path or not os.path.exists(input_path):
-                messagebox.showerror("错误", "请选择有效的输入视频文件")
-                return
-
-            output_dir = self.output_dir.get()
-            if not output_dir:
-                messagebox.showerror("错误", "请选择输出目录")
-                return
+            self.log(
+                f"开始处理视频 {self.current_video_index + 1}/{len(self.input_paths)}: {os.path.basename(video_path)}")
 
             # 设置视频基础名称
-            self.video_base_name = Path(input_path).stem
-
-            # 验证参数
-            try:
-                hash_threshold = int(self.hash_threshold_var.get())
-                ssim_threshold = float(self.ssim_threshold_var.get())
-                history_size = int(self.history_size_var.get())
-
-                if hash_threshold < 0 or hash_threshold > 10:
-                    messagebox.showwarning("警告", "哈希相似度阈值必须在0-10之间")
-                    self.hash_threshold_var.set("3")
-                    return
-
-                if ssim_threshold < 0.9 or ssim_threshold > 1.0:
-                    messagebox.showwarning("警告", "SSIM阈值必须在0.9-1.0之间")
-                    self.ssim_threshold_var.set("0.98")
-                    return
-
-                if history_size < 1 or history_size > 100:
-                    messagebox.showwarning("警告", "历史帧数量必须在1-100之间")
-                    self.history_size_var.set("20")
-                    return
-            except ValueError:
-                messagebox.showerror("错误", "参数格式错误")
-                return
-
-            # 创建输出目录
-            os.makedirs(output_dir, exist_ok=True)
+            self.video_base_name = Path(video_path).stem
 
             # 设置临时目录（基于视频文件名）
-            temp_dirs = self.setup_temp_dirs()
+            temp_dirs = self.setup_temp_dirs(video_path)
             if not temp_dirs:
                 raise ValueError("无法创建临时目录")
 
@@ -1951,20 +1872,11 @@ class APISRVideoProcessor:
             if self.test_mode_var.get():
                 self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
 
-            # 重置重复帧计数（无论是否继续任务都重置）
+            # 重置重复帧计数（每个视频开始时重置）
             self.dup_frame_count = 0
             self.update_dup_info(self.dup_frame_count)
 
-            # 更新状态
-            self.processing = True
-            self.paused = False
-            self.stopped = False
-            self.process_btn.config(state='disabled')
-            self.pause_btn.config(state='normal')
-            self.stop_btn.config(state='normal')
-            self.update_status("处理中...", "blue")
-
-            # 检查是否有进度数据
+            # 检查是否有该视频的进度数据
             progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
 
             if os.path.exists(progress_file):
@@ -2000,7 +1912,7 @@ class APISRVideoProcessor:
             if not self.segments or self.current_segment_index == 0:
                 self.log("步骤2: 分割视频...")
                 segment_duration = float(self.segment_duration.get())
-                self.segments = self.split_video_by_keyframes(input_path, segment_duration, temp_dirs['base'])
+                self.segments = self.split_video_by_keyframes(video_path, segment_duration, temp_dirs['base'])
                 self.total_segments = len(self.segments)
                 self.update_progress(10)
 
@@ -2106,9 +2018,8 @@ class APISRVideoProcessor:
             if self.stopped:
                 self.log(
                     f"处理已停止，进度已保存于片段 {self.current_segment_index} 的第 {self.current_frame_in_segment} 帧")
-                self.update_status("已停止，进度已保存", "orange")
                 self.save_progress(force=True)
-                return
+                return False
 
             # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
             if not self.test_mode_var.get():
@@ -2122,12 +2033,12 @@ class APISRVideoProcessor:
                 if processed_segments_paths:
                     if len(processed_segments_paths) > 1:
                         output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                        final_output = os.path.join(output_dir, output_filename)
+                        final_output = os.path.join(self.output_dir.get(), output_filename)
                         self.concatenate_videos(processed_segments_paths, final_output)
                     else:
                         # 如果只有一个片段，直接复制
                         output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                        final_output = os.path.join(output_dir, output_filename)
+                        final_output = os.path.join(self.output_dir.get(), output_filename)
                         shutil.copy2(processed_segments_paths[0], final_output)
 
                     self.update_progress(95)
@@ -2148,35 +2059,14 @@ class APISRVideoProcessor:
             self.update_progress(100)
 
             if self.test_mode_var.get():
-                self.update_status("测试完成！", "green")
                 self.log("测试模式完成！")
                 self.log(f"重复帧检测统计：总计检测到 {self.dup_frame_count} 个重复帧")
                 self.log(f"测试结果保存在: {temp_dirs['base']}")
-
-                # 显示完成消息
-                messagebox.showinfo("测试完成",
-                                    f"重复帧检测测试完成！\n\n"
-                                    f"检测到 {self.dup_frame_count} 个重复帧\n"
-                                    f"测试结果保存在: {temp_dirs['base']}\n\n"
-                                    f"请检查重复帧记录文件")
             else:
-                self.update_status("处理完成！", "green")
-
-                # 显示完成消息
-                if all_processed_frames:
-                    output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                    self.log(f"处理完成！输出文件: {output_filename}")
-                    # 显示重复帧统计
-                    if self.enable_dup_detect_var.get():
-                        self.log(f"总计检测到 {self.dup_frame_count} 个重复帧，已复用处理结果，加速了处理速度")
-
-                    messagebox.showinfo("完成",
-                                        f"视频处理完成！\n\n"
-                                        f"输出文件: {output_filename}\n"
-                                        f"输出目录: {output_dir}\n\n"
-                                        f"重复帧检测: {self.dup_frame_count} 帧已复用")
-                else:
-                    self.log("处理完成！但没有生成输出文件")
+                self.log(f"处理完成！输出文件: {self.video_base_name}_super_resolved.mp4")
+                # 显示重复帧统计
+                if self.enable_dup_detect_var.get():
+                    self.log(f"总计检测到 {self.dup_frame_count} 个重复帧，已复用处理结果，加速了处理速度")
 
             # 重置状态
             self.current_segment_index = 0
@@ -2195,8 +2085,111 @@ class APISRVideoProcessor:
             self.frame_sr_history.clear()
             self.frame_idx_history.clear()
 
+            return True
+
         except Exception as e:
-            self.log(f"处理失败: {str(e)}")
+            self.log(f"处理视频失败: {str(e)}")
+            # 保存进度以便恢复
+            self.save_progress(force=True)
+            return False
+
+    def process_videos(self):
+        """主处理函数 - 处理多个视频"""
+        try:
+            # 检查输入
+            if not self.input_paths:
+                messagebox.showerror("错误", "请选择有效的输入视频文件")
+                return
+
+            output_dir = self.output_dir.get()
+            if not output_dir:
+                messagebox.showerror("错误", "请选择输出目录")
+                return
+
+            # 验证参数
+            try:
+                hash_threshold = int(self.hash_threshold_var.get())
+                ssim_threshold = float(self.ssim_threshold_var.get())
+                history_size = int(self.history_size_var.get())
+
+                if hash_threshold < 0 or hash_threshold > 10:
+                    messagebox.showwarning("警告", "哈希相似度阈值必须在0-10之间")
+                    self.hash_threshold_var.set("3")
+                    return
+
+                if ssim_threshold < 0.9 or ssim_threshold > 1.0:
+                    messagebox.showwarning("警告", "SSIM阈值必须在0.9-1.0之间")
+                    self.ssim_threshold_var.set("0.98")
+                    return
+
+                if history_size < 1 or history_size > 100:
+                    messagebox.showwarning("警告", "历史帧数量必须在1-100之间")
+                    self.history_size_var.set("20")
+                    return
+            except ValueError:
+                messagebox.showerror("错误", "参数格式错误")
+                return
+
+            # 创建输出目录
+            os.makedirs(output_dir, exist_ok=True)
+
+            # 更新状态
+            self.processing = True
+            self.paused = False
+            self.stopped = False
+            self.process_btn.config(state='disabled')
+            self.pause_btn.config(state='normal')
+            self.stop_btn.config(state='normal')
+            self.update_status("批量处理中...", "blue")
+
+            # 处理每个视频
+            total_videos = len(self.input_paths)
+            for i in range(self.current_video_index, total_videos):
+                if self.stopped:
+                    break
+
+                self.current_video_index = i
+                video_path = self.input_paths[i]
+
+                # 更新进度信息
+                self.progress_info.config(text=f"正在处理视频 {i + 1}/{total_videos}: {os.path.basename(video_path)}")
+                self.root.update_idletasks()
+
+                # 处理单个视频
+                success = self.process_single_video(video_path)
+
+                if not success and not self.stopped:
+                    # 单个视频处理失败，但用户没有停止，继续处理下一个
+                    self.log(f"视频处理失败，继续处理下一个视频")
+                    continue
+
+                if self.stopped:
+                    break
+
+            if self.stopped:
+                self.log(f"批量处理已停止，进度已保存")
+                self.update_status("已停止，进度已保存", "orange")
+                return
+
+            # 所有视频处理完成
+            if self.test_mode_var.get():
+                self.update_status("测试完成！", "green")
+                messagebox.showinfo("测试完成",
+                                    f"批量测试完成！\n\n"
+                                    f"共处理 {total_videos} 个视频\n"
+                                    f"测试结果保存在各视频的临时目录中")
+            else:
+                self.update_status("批量处理完成！", "green")
+                messagebox.showinfo("完成",
+                                    f"批量处理完成！\n\n"
+                                    f"共处理 {total_videos} 个视频\n"
+                                    f"输出目录: {output_dir}")
+
+            # 重置状态
+            self.current_video_index = 0
+
+        except Exception as e:
+            self.log(f"批量处理失败: {str(e)}")
             self.update_status(f"处理失败: {str(e)}", "red")
             messagebox.showerror("错误", f"处理失败: {str(e)}")
             # 保存进度以便恢复
@@ -2252,7 +2245,7 @@ class APISRVideoProcessor:
             return
 
         # 在新线程中运行处理
-        self.processing_thread = threading.Thread(target=self.process_video)
+        self.processing_thread = threading.Thread(target=self.process_videos)
         self.processing_thread.daemon = True
         self.processing_thread.start()
 
@@ -2347,6 +2340,7 @@ class APISRVideoProcessor:
             self.update_status("已停止，进度未保存", "orange")
 
             # 重置进度
+            self.current_video_index = 0
             self.current_segment_index = 0
             self.current_frame_in_segment = 0
             self.dup_frame_count = 0

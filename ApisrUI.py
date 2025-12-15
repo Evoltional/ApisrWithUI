@@ -334,7 +334,7 @@ class APISRVideoProcessor:
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v1.8",  # 更新版本号
+        version_label = tk.Label(title_frame, text="v1.8",
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
@@ -1548,6 +1548,46 @@ class APISRVideoProcessor:
 
         return result_np, current_hash, current_thumbnail, is_duplicate
 
+    def apply_new_settings(self):
+        """应用新的设置到当前处理中"""
+        self.log("正在应用新的设置...")
+
+        # 重新初始化历史帧缓存
+        self.init_history_cache()
+        self.log("历史帧缓存已重新初始化")
+
+        # 重新加载模型（如果设置改变了）
+        if not self.test_mode_var.get() and self.generator is not None:
+            self.log("重新加载模型以应用新设置...")
+            # 清空GPU内存
+            del self.generator
+            torch.cuda.empty_cache()
+
+            try:
+                self.generator = self.load_model()
+                self.log("模型重新加载成功")
+            except Exception as e:
+                self.log(f"重新加载模型失败: {e}")
+                self.generator = None
+
+        # 记录当前设置
+        if self.enable_dup_detect_var.get():
+            methods = []
+            if self.use_hash_var.get():
+                methods.append(f"哈希(阈值:{self.hash_threshold_var.get()})")
+            if self.use_ssim_var.get():
+                methods.append(f"SSIM(阈值:{self.ssim_threshold_var.get()})")
+
+            if self.enable_history_var.get():
+                history_size = int(self.history_size_var.get())
+                self.log(f"重复帧检测: {', '.join(methods)}，历史帧数量: {history_size}")
+            else:
+                self.log(f"重复帧检测: {', '.join(methods)}，历史帧功能: 禁用")
+        else:
+            self.log("重复帧检测已禁用")
+
+        return True
+
     def process_segment_frames(self, segment_path, segment_index):
         """处理视频片段的所有帧（逐帧处理）"""
         segment_name = os.path.basename(segment_path)
@@ -1674,6 +1714,10 @@ class APISRVideoProcessor:
 
                 if self.stopped:
                     break
+
+                # 恢复时应用最新的设置
+                self.log("暂停后继续，正在检查并应用新设置...")
+                self.apply_new_settings()
 
                 # 恢复时重新加载模型（如果需要）
                 if not self.test_mode_var.get() and self.generator is None:

@@ -89,6 +89,8 @@ class APISRVideoProcessor:
         self.test_mode_var = tk.BooleanVar(value=False)
         self.enable_history_var = tk.BooleanVar(value=True)
         self.history_size_var = tk.StringVar(value="20")
+        self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
+        self.last_test_mode_state = False  # 记录上一次的测试模式状态
 
         # 设置样式
         self.setup_styles()
@@ -130,6 +132,7 @@ class APISRVideoProcessor:
         self.temp_base_dir = None
         self.current_segment_frames_dir = None
         self.video_base_name = None
+        self.is_test_mode_folder = False  # 新增：标记是否为测试模式文件夹
 
         # 线程控制
         self.processing_thread = None
@@ -157,6 +160,9 @@ class APISRVideoProcessor:
 
         # 绑定配置保存事件
         self.setup_config_save_bindings()
+
+        # 跟踪测试模式变化
+        self.test_mode_var.trace('w', self.on_test_mode_changed)
 
     def load_config(self):
         """加载配置文件"""
@@ -194,10 +200,13 @@ class APISRVideoProcessor:
                     self.use_hash_var.set(config['use_hash'])
                 if 'test_mode' in config:
                     self.test_mode_var.set(config['test_mode'])
+                    self.last_test_mode_state = config['test_mode']  # 记录初始状态
                 if 'enable_history' in config:
                     self.enable_history_var.set(config['enable_history'])
                 if 'history_size' in config:
                     self.history_size_var.set(str(config['history_size']))
+                if 'immediate_merge' in config:
+                    self.immediate_merge_var.set(config['immediate_merge'])
 
                 self.log(f"已从 {self.config_file} 加载配置")
 
@@ -229,6 +238,7 @@ class APISRVideoProcessor:
                 'test_mode': self.test_mode_var.get(),
                 'enable_history': self.enable_history_var.get(),
                 'history_size': int(self.history_size_var.get()),
+                'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
                 'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
@@ -238,6 +248,64 @@ class APISRVideoProcessor:
             self.log(f"配置已保存到 {self.config_file}")
         except Exception as e:
             self.log(f"保存配置文件时出错: {e}")
+
+    def on_test_mode_changed(self, *args):
+        """测试模式变化时的处理"""
+        current_state = self.test_mode_var.get()
+
+        # 如果从非测试模式切换到测试模式
+        if current_state and not self.last_test_mode_state:
+            # 弹出确认窗口
+            response = messagebox.askyesno("确认测试模式",
+                                           "测试模式仅进行重复帧检测，不进行超分辨率处理，且会创建单独的测试文件夹。\n\n"
+                                           "是否确认启用测试模式？")
+
+            if not response:
+                # 用户取消，恢复原来的状态
+                self.test_mode_var.set(False)
+                return
+            else:
+                self.log("测试模式已启用 - 仅进行重复帧检测，不进行超分辨率处理")
+
+        # 如果从测试模式切换到非测试模式
+        elif not current_state and self.last_test_mode_state:
+            response = messagebox.askyesno("退出测试模式",
+                                           "退出测试模式将删除测试模式产生的临时文件。\n\n"
+                                           "是否确认退出测试模式？")
+
+            if response:
+                # 清理测试模式的临时文件
+                self.cleanup_test_mode_files()
+                self.log("已退出测试模式，测试文件已清理")
+            else:
+                # 用户取消，恢复测试模式
+                self.test_mode_var.set(True)
+                return
+
+        # 更新状态记录
+        self.last_test_mode_state = current_state
+
+    def cleanup_test_mode_files(self):
+        """清理测试模式产生的临时文件"""
+        output_dir = self.output_dir.get()
+        if not output_dir or not os.path.exists(output_dir):
+            return
+
+        # 查找所有测试模式的临时目录
+        test_temp_dirs = []
+        for item in os.listdir(output_dir):
+            item_path = os.path.join(output_dir, item)
+            if os.path.isdir(item_path) and item.endswith("_test_temp"):
+                test_temp_dirs.append(item_path)
+
+        if test_temp_dirs:
+            self.log(f"找到 {len(test_temp_dirs)} 个测试模式临时目录")
+            for temp_dir in test_temp_dirs:
+                try:
+                    shutil.rmtree(temp_dir)
+                    self.log(f"已清理测试临时目录: {os.path.basename(temp_dir)}")
+                except Exception as e:
+                    self.log(f"清理测试临时目录时出错: {e}")
 
     def setup_history_size_validation(self):
         """设置历史帧数量输入的验证"""
@@ -334,7 +402,7 @@ class APISRVideoProcessor:
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v1.8",
+        version_label = tk.Label(title_frame, text="v1.9",  # 版本更新
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
@@ -470,12 +538,14 @@ class APISRVideoProcessor:
             self.enable_dup_detect_var,
             self.use_ssim_var,
             self.use_hash_var,
-            self.test_mode_var,
-            self.enable_history_var,
+            self.immediate_merge_var,  # 新增
         ]
 
         for var in boolean_vars:
             var.trace('w', lambda *args: self.save_config())
+
+        # 测试模式单独处理，因为有弹窗确认
+        # 注意：测试模式的trace已经在__init__中单独设置
 
     def setup_left_panel(self, parent):
         """设置左侧参数面板"""
@@ -658,6 +728,10 @@ class APISRVideoProcessor:
         ttk.Checkbutton(options_frame, text="测试模式(仅重复帧检测)",
                         variable=self.test_mode_var).pack(anchor=tk.W, pady=2)
 
+        # 新增：立即合成视频选项
+        ttk.Checkbutton(options_frame, text="立即合成视频",
+                        variable=self.immediate_merge_var).pack(anchor=tk.W, pady=2)
+
         ttk.Checkbutton(options_frame, text="启用配置自动保存",
                         command=self.save_config).pack(anchor=tk.W, pady=2)
 
@@ -669,7 +743,9 @@ class APISRVideoProcessor:
 2. 暂停时可保存进度
 3. 重复帧检测可加速处理
 4. 历史帧数量可配置
-5. 配置自动保存"""
+5. 配置自动保存
+6. 测试模式有确认窗口
+7. 可立即合成视频"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -769,7 +845,7 @@ class APISRVideoProcessor:
                 self.log(f"打开目录失败: {e}")
 
     def setup_temp_dirs(self, video_path):
-        """设置临时目录结构 - 基于视频文件名"""
+        """设置临时目录结构 - 基于视频文件名和测试模式"""
         output_dir = self.output_dir.get()
         if not output_dir:
             return None
@@ -777,8 +853,16 @@ class APISRVideoProcessor:
         # 获取视频基础名称
         video_name = Path(video_path).stem
 
+        # 根据测试模式添加后缀
+        if self.test_mode_var.get():
+            temp_dir_suffix = "_test_temp"
+            self.is_test_mode_folder = True
+        else:
+            temp_dir_suffix = "_temp"
+            self.is_test_mode_folder = False
+
         # 基于视频文件名创建临时目录
-        temp_dir_name = f"{video_name}_temp"
+        temp_dir_name = f"{video_name}{temp_dir_suffix}"
         self.temp_base_dir = os.path.join(output_dir, temp_dir_name)
 
         # 创建标准化的目录结构
@@ -788,7 +872,8 @@ class APISRVideoProcessor:
             'audio': os.path.join(self.temp_base_dir, "02_audio"),
             'segment_frames': os.path.join(self.temp_base_dir, "03_segment_frames"),  # 直接放置before/after文件夹
             'processed_segments': os.path.join(self.temp_base_dir, "04_processed_segments"),
-            'logs': os.path.join(self.temp_base_dir, "05_logs")
+            'logs': os.path.join(self.temp_base_dir, "05_logs"),
+            'immediate_merge': os.path.join(self.temp_base_dir, "06_immediate_merge")  # 新增：立即合成目录
         }
 
         # 创建目录
@@ -836,12 +921,13 @@ class APISRVideoProcessor:
             temp_dirs = []
             for item in os.listdir(output_dir):
                 item_path = os.path.join(output_dir, item)
-                if os.path.isdir(item_path) and item.endswith("_temp"):
+                if os.path.isdir(item_path) and (item.endswith("_temp") or item.endswith("_test_temp")):
                     temp_dirs.append(item_path)
 
             if temp_dirs:
                 response = messagebox.askyesno("清理临时文件",
-                                               f"找到 {len(temp_dirs)} 个临时目录。是否清理所有临时文件？")
+                                               f"找到 {len(temp_dirs)} 个临时目录。是否清理所有临时文件？\n"
+                                               f"（包括普通模式和测试模式的临时文件）")
                 if response:
                     for temp_dir in temp_dirs:
                         try:
@@ -936,12 +1022,14 @@ class APISRVideoProcessor:
             'test_mode': self.test_mode_var.get(),
             'enable_history': self.enable_history_var.get(),
             'history_size': int(self.history_size_var.get()),
+            'immediate_merge': self.immediate_merge_var.get(),  # 新增
             'current_segment_index': self.current_segment_index,
             'current_frame_in_segment': self.current_frame_in_segment,
             'total_segments': self.total_segments,
             'segments': self.segments,
             'processed_segments': self.processed_segments,
             'temp_base_dir': self.temp_base_dir,
+            'is_test_mode_folder': self.is_test_mode_folder,  # 新增
             'dup_frame_count': self.dup_frame_count,
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
@@ -1586,6 +1674,12 @@ class APISRVideoProcessor:
         else:
             self.log("重复帧检测已禁用")
 
+        # 记录立即合成设置
+        if self.immediate_merge_var.get():
+            self.log("立即合成视频功能已启用")
+        else:
+            self.log("立即合成视频功能已禁用")
+
         return True
 
     def process_segment_frames(self, segment_path, segment_index):
@@ -1897,6 +1991,64 @@ class APISRVideoProcessor:
             if os.path.exists(list_file):
                 os.remove(list_file)
 
+    def immediate_merge_segment(self, processed_segment_path, segment_index):
+        """立即合并当前处理好的片段到整体视频中"""
+        if not self.immediate_merge_var.get() or self.test_mode_var.get():
+            return None
+
+        # 检查是否已经有合并的视频
+        merge_dir = os.path.join(self.temp_base_dir, "06_immediate_merge")
+        merged_video_path = os.path.join(merge_dir, f"merged_up_to_{segment_index:03d}.mp4")
+
+        # 如果是第一个片段，直接复制
+        if segment_index == 0 or not os.path.exists(
+                merged_video_path.replace(f"_{segment_index:03d}.mp4", f"_{segment_index - 1:03d}.mp4")):
+            shutil.copy2(processed_segment_path, merged_video_path)
+            self.log(f"立即合成: 创建初始合并视频 {segment_index:03d}")
+            return merged_video_path
+
+        # 获取上一个合并的视频
+        prev_merged_video = os.path.join(merge_dir, f"merged_up_to_{segment_index - 1:03d}.mp4")
+
+        if not os.path.exists(prev_merged_video):
+            self.log(f"立即合成: 找不到上一个合并视频，跳过")
+            return None
+
+        # 合并当前片段到上一个合并视频
+        try:
+            # 创建临时文件列表
+            list_file = tempfile.mktemp(suffix=".txt")
+
+            with open(list_file, 'w', encoding='utf-8') as f:
+                f.write(f"file '{os.path.abspath(prev_merged_video)}'\n")
+                f.write(f"file '{os.path.abspath(processed_segment_path)}'\n")
+
+            # 使用ffmpeg合并
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', list_file,
+                '-c', 'copy',
+                merged_video_path
+            ]
+
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            self.log(f"立即合成: 成功合并片段 {segment_index} 到整体视频")
+
+            # 删除上一个合并视频以节省空间
+            if os.path.exists(prev_merged_video):
+                os.remove(prev_merged_video)
+
+            return merged_video_path
+
+        except Exception as e:
+            self.log(f"立即合成失败: {e}")
+            return None
+        finally:
+            if os.path.exists(list_file):
+                os.remove(list_file)
+
     def process_single_video(self, video_path):
         """处理单个视频"""
         try:
@@ -1906,12 +2058,14 @@ class APISRVideoProcessor:
             # 设置视频基础名称
             self.video_base_name = Path(video_path).stem
 
-            # 设置临时目录（基于视频文件名）
+            # 设置临时目录（基于视频文件名和测试模式）
             temp_dirs = self.setup_temp_dirs(video_path)
             if not temp_dirs:
                 raise ValueError("无法创建临时目录")
 
             self.log(f"临时文件目录: {temp_dirs['base']}")
+            if self.is_test_mode_folder:
+                self.log("注意：当前为测试模式文件夹")
 
             if self.test_mode_var.get():
                 self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
@@ -1927,6 +2081,26 @@ class APISRVideoProcessor:
                 try:
                     with open(progress_file, 'rb') as f:
                         progress_data = pickle.load(f)
+
+                    # 检查是否是从测试模式恢复的进度
+                    saved_test_mode = progress_data.get('is_test_mode_folder', False)
+                    if saved_test_mode != self.is_test_mode_folder:
+                        self.log(
+                            f"警告：进度文件的测试模式状态({saved_test_mode})与当前设置({self.is_test_mode_folder})不匹配")
+                        if self.is_test_mode_folder:
+                            self.log("当前为测试模式，将忽略测试模式的进度文件")
+                            # 删除测试模式的进度文件
+                            os.remove(progress_file)
+                            self.log("已删除测试模式进度文件")
+                        else:
+                            # 正常模式下发现测试模式进度文件
+                            response = messagebox.askyesno("发现测试模式进度",
+                                                           "发现测试模式的进度文件，是否删除并重新开始？")
+                            if response:
+                                os.remove(progress_file)
+                                self.log("已删除测试模式进度文件，重新开始处理")
+                            else:
+                                self.log("使用测试模式进度继续处理")
 
                     # 恢复进度
                     self.current_segment_index = progress_data.get('current_segment_index', 0)
@@ -1947,10 +2121,14 @@ class APISRVideoProcessor:
                     self.dup_frame_count = 0
 
             # 步骤1: 加载模型
-            self.log("步骤1: 加载模型...")
-            self.update_progress(0)
-            self.generator = self.load_model()
-            self.update_progress(5)
+            if not self.test_mode_var.get():
+                self.log("步骤1: 加载模型...")
+                self.update_progress(0)
+                self.generator = self.load_model()
+                self.update_progress(5)
+            else:
+                self.log("测试模式：跳过模型加载")
+                self.update_progress(5)
 
             # 步骤2: 分割视频（如果需要）
             if not self.segments or self.current_segment_index == 0:
@@ -2032,6 +2210,12 @@ class APISRVideoProcessor:
                     # 将帧转换为视频
                     self.frames_to_video(frame_files, output_segment, fps, output_width, output_height, audio_path)
 
+                    # 立即合并视频（如果启用）
+                    if self.immediate_merge_var.get():
+                        merged_video = self.immediate_merge_segment(output_segment, i)
+                        if merged_video:
+                            self.log(f"片段 {i + 1} 已立即合并到整体视频")
+
                     all_processed_frames.extend(frame_files)
                     if audio_path:
                         all_audio_paths.append(audio_path)
@@ -2067,28 +2251,79 @@ class APISRVideoProcessor:
 
             # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
             if not self.test_mode_var.get():
-                self.log("步骤4: 拼接处理后的视频片段...")
-                processed_segments_paths = []
-                for segment_name in self.processed_segments:
-                    processed_path = os.path.join(temp_dirs['processed_segments'], f"processed_{segment_name}")
-                    if os.path.exists(processed_path):
-                        processed_segments_paths.append(processed_path)
+                # 检查是否有立即合成的最终视频
+                merge_dir = os.path.join(self.temp_base_dir, "06_immediate_merge")
+                if self.immediate_merge_var.get() and os.path.exists(merge_dir):
+                    # 查找最新的合并视频
+                    merged_files = []
+                    for f in os.listdir(merge_dir):
+                        if f.startswith("merged_up_to_") and f.endswith(".mp4"):
+                            merged_files.append(os.path.join(merge_dir, f))
 
-                if processed_segments_paths:
-                    if len(processed_segments_paths) > 1:
+                    if merged_files:
+                        # 按数字排序
+                        merged_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                        latest_merged = merged_files[-1]
+
+                        # 将最终合并视频移动到输出目录
                         output_filename = f"{self.video_base_name}_super_resolved.mp4"
                         final_output = os.path.join(self.output_dir.get(), output_filename)
-                        self.concatenate_videos(processed_segments_paths, final_output)
+                        shutil.copy2(latest_merged, final_output)
+
+                        self.update_progress(95)
+                        self.log(f"使用立即合成的视频作为最终输出: {final_output}")
+
+                        # 清理立即合成目录
+                        shutil.rmtree(merge_dir)
+                        self.log("已清理立即合成目录")
                     else:
-                        # 如果只有一个片段，直接复制
-                        output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                        final_output = os.path.join(self.output_dir.get(), output_filename)
-                        shutil.copy2(processed_segments_paths[0], final_output)
+                        # 如果没有立即合成视频，则使用传统拼接方式
+                        self.log("步骤4: 拼接处理后的视频片段...")
+                        processed_segments_paths = []
+                        for segment_name in self.processed_segments:
+                            processed_path = os.path.join(temp_dirs['processed_segments'], f"processed_{segment_name}")
+                            if os.path.exists(processed_path):
+                                processed_segments_paths.append(processed_path)
 
-                    self.update_progress(95)
-                    self.log(f"最终输出文件: {final_output}")
+                        if processed_segments_paths:
+                            if len(processed_segments_paths) > 1:
+                                output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                                final_output = os.path.join(self.output_dir.get(), output_filename)
+                                self.concatenate_videos(processed_segments_paths, final_output)
+                            else:
+                                # 如果只有一个片段，直接复制
+                                output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                                final_output = os.path.join(self.output_dir.get(), output_filename)
+                                shutil.copy2(processed_segments_paths[0], final_output)
+
+                            self.update_progress(95)
+                            self.log(f"最终输出文件: {final_output}")
+                        else:
+                            self.log("没有可拼接的片段")
                 else:
-                    self.log("没有可拼接的片段")
+                    # 传统拼接方式
+                    self.log("步骤4: 拼接处理后的视频片段...")
+                    processed_segments_paths = []
+                    for segment_name in self.processed_segments:
+                        processed_path = os.path.join(temp_dirs['processed_segments'], f"processed_{segment_name}")
+                        if os.path.exists(processed_path):
+                            processed_segments_paths.append(processed_path)
+
+                    if processed_segments_paths:
+                        if len(processed_segments_paths) > 1:
+                            output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                            final_output = os.path.join(self.output_dir.get(), output_filename)
+                            self.concatenate_videos(processed_segments_paths, final_output)
+                        else:
+                            # 如果只有一个片段，直接复制
+                            output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                            final_output = os.path.join(self.output_dir.get(), output_filename)
+                            shutil.copy2(processed_segments_paths[0], final_output)
+
+                        self.update_progress(95)
+                        self.log(f"最终输出文件: {final_output}")
+                    else:
+                        self.log("没有可拼接的片段")
             else:
                 self.log("测试模式：跳过视频合成步骤")
                 self.update_progress(95)
@@ -2106,6 +2341,7 @@ class APISRVideoProcessor:
                 self.log("测试模式完成！")
                 self.log(f"重复帧检测统计：总计检测到 {self.dup_frame_count} 个重复帧")
                 self.log(f"测试结果保存在: {temp_dirs['base']}")
+                # 测试模式下不删除临时文件，供用户查看结果
             else:
                 self.log(f"处理完成！输出文件: {self.video_base_name}_super_resolved.mp4")
                 # 显示重复帧统计

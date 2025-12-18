@@ -380,12 +380,6 @@ class APISRVideoProcessor:
         self.frame_sr_history = collections.deque(maxlen=history_size)
         self.frame_idx_history = collections.deque(maxlen=history_size)
 
-        # 记录历史帧设置
-        if hasattr(self, 'log_text') and self.enable_history_var.get():
-            self.log(f"历史帧功能已启用，缓存大小: {history_size} 帧")
-        elif hasattr(self, 'log_text') and not self.enable_history_var.get():
-            self.log("历史帧功能已禁用，只与前一帧比较")
-
     def setup_ui(self):
         """设置UI布局"""
         # 主容器
@@ -402,7 +396,7 @@ class APISRVideoProcessor:
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v1.9",  # 版本更新
+        version_label = tk.Label(title_frame, text="v2.0",  # 版本更新到2.0
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
@@ -745,7 +739,8 @@ class APISRVideoProcessor:
 4. 历史帧数量可配置
 5. 配置自动保存
 6. 测试模式有确认窗口
-7. 可立即合成视频"""
+7. 可立即合成视频
+8. 新增性能计时功能"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -772,7 +767,6 @@ class APISRVideoProcessor:
             self.log("历史帧功能已启用")
         else:
             self.history_entry.config(state='disabled')
-            self.log("历史帧功能已禁用")
 
     def get_gpu_info(self):
         """获取GPU信息"""
@@ -909,9 +903,8 @@ class APISRVideoProcessor:
             if os.path.exists(dir_path):
                 try:
                     shutil.rmtree(dir_path)
-                    self.log(f"已清理临时帧目录: {os.path.basename(dir_path)}")
                 except Exception as e:
-                    self.log(f"清理临时帧目录时出错: {e}")
+                    pass
 
     def cleanup_temp_files(self):
         """清理临时文件"""
@@ -1052,6 +1045,8 @@ class APISRVideoProcessor:
 
     def load_rrdb(self, generator_weight_PATH, scale, print_options=False):
         '''加载RRDB模型'''
+        start_time = time.time()
+
         # 加载检查点
         checkpoint_g = torch.load(generator_weight_PATH)
 
@@ -1092,10 +1087,15 @@ class APISRVideoProcessor:
                     value = checkpoint_g['opt'][key]
                     print(f'{key} : {value}')
 
+        elapsed = time.time() - start_time
+        self.log(f"RRDB模型加载耗时: {elapsed:.2f}秒")
+
         return generator
 
     def load_cunet(self, generator_weight_PATH, scale, print_options=False):
         '''加载CUNET模型'''
+        start_time = time.time()
+
         if scale != 2:
             raise NotImplementedError("We only support 2x in CUNET")
 
@@ -1136,10 +1136,15 @@ class APISRVideoProcessor:
                     value = checkpoint_g['opt'][key]
                     print(f'{key} : {value}')
 
+        elapsed = time.time() - start_time
+        self.log(f"CUNET模型加载耗时: {elapsed:.2f}秒")
+
         return generator
 
     def load_grl(self, generator_weight_PATH, scale=4):
         '''加载GRL模型'''
+        start_time = time.time()
+
         # 加载检查点
         checkpoint_g = torch.load(generator_weight_PATH)
 
@@ -1176,12 +1181,17 @@ class APISRVideoProcessor:
         for p in generator.parameters():
             if p.requires_grad:
                 num_params += p.numel()
+
+        elapsed = time.time() - start_time
+        self.log(f"GRL模型加载耗时: {elapsed:.2f}秒")
         self.log(f"GRL模型参数数量: {num_params / 10 ** 6: 0.2f}M")
 
         return generator
 
     def load_dat(self, generator_weight_PATH, scale=4):
         '''加载DAT模型'''
+        start_time = time.time()
+
         # 加载检查点
         checkpoint_g = torch.load(generator_weight_PATH)
 
@@ -1214,6 +1224,9 @@ class APISRVideoProcessor:
         for p in generator.parameters():
             if p.requires_grad:
                 num_params += p.numel()
+
+        elapsed = time.time() - start_time
+        self.log(f"DAT模型加载耗时: {elapsed:.2f}秒")
         self.log(f"DAT模型参数数量: {num_params / 10 ** 6: 0.2f}M")
 
         return generator
@@ -1224,6 +1237,8 @@ class APISRVideoProcessor:
 
     def calculate_frame_hash(self, frame):
         """计算帧的感知哈希值（优化版）"""
+        start_time = time.time()
+
         # 先缩小图像以减少计算量
         h, w = frame.shape[:2]
         if h > 360 or w > 480:
@@ -1239,10 +1254,16 @@ class APISRVideoProcessor:
         # 使用更高效的哈希方法
         frame_hash = imagehash.phash(pil_img, hash_size=8)  # 减小哈希大小以提高计算速度
 
+        elapsed = time.time() - start_time
+        if elapsed > 0.01:  # 只记录耗时较长的哈希计算
+            self.log(f"哈希计算耗时: {elapsed:.3f}秒")
+
         return frame_hash
 
     def calculate_ssim_fast(self, frame1, frame2):
         """快速计算SSIM（优化版）"""
+        start_time = time.time()
+
         # 将图像缩小以加速计算
         h1, w1 = frame1.shape[:2]
         h2, w2 = frame2.shape[:2]
@@ -1269,8 +1290,15 @@ class APISRVideoProcessor:
 
         try:
             ssim_value, _ = ssim(gray1, gray2, full=True, data_range=255)
+
+            elapsed = time.time() - start_time
+            if elapsed > 0.01:  # 只记录耗时较长的SSIM计算
+                self.log(f"SSIM计算耗时: {elapsed:.3f}秒，结果: {ssim_value:.4f}")
+
             return ssim_value
         except:
+            elapsed = time.time() - start_time
+            self.log(f"SSIM计算失败，耗时: {elapsed:.3f}秒")
             return 0.0
 
     def check_frame_duplicate_enhanced(self, frame, frame_idx):
@@ -1278,15 +1306,23 @@ class APISRVideoProcessor:
         if not self.enable_dup_detect_var.get() or not self.frame_history:
             return False, None, None, None
 
+        start_time = time.time()
+        history_size = len(self.frame_history)
+
         current_hash = None
         current_thumbnail = None
 
         # 计算当前帧的信息（按需计算）
+        hash_time = 0
         if self.use_hash_var.get():
+            hash_start = time.time()
             current_hash = self.calculate_frame_hash(frame)
+            hash_time = time.time() - hash_start
 
+        ssim_thumbnail_time = 0
         if self.use_ssim_var.get():
             # 保存缩略图用于SSIM计算
+            thumb_start = time.time()
             h, w = frame.shape[:2]
             if h > 180 or w > 320:
                 new_h = 180
@@ -1294,6 +1330,7 @@ class APISRVideoProcessor:
                 current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             else:
                 current_thumbnail = frame.copy()
+            ssim_thumbnail_time = time.time() - thumb_start
 
         # 获取阈值
         hash_threshold = int(self.hash_threshold_var.get())
@@ -1306,6 +1343,10 @@ class APISRVideoProcessor:
         best_ssim_value = None
 
         # 遍历历史帧（从最近的开始）
+        compare_start = time.time()
+        ssim_compare_time = 0
+        hash_compare_time = 0
+
         for i, (hist_frame, hist_hash, hist_thumbnail, hist_sr_result, hist_frame_idx) in enumerate(
                 zip(self.frame_history, self.frame_hash_history,
                     self.frame_thumbnail_history if self.use_ssim_var.get() else [None] * len(self.frame_history),
@@ -1318,11 +1359,17 @@ class APISRVideoProcessor:
 
             # 如果使用哈希检测
             if self.use_hash_var.get() and current_hash is not None and hist_hash is not None:
+                hash_compare_start = time.time()
                 hash_diff = current_hash - hist_hash
+                hash_compare_time += time.time() - hash_compare_start
+
                 if hash_diff <= hash_threshold:
                     # 如果同时启用了SSIM检测，需要验证SSIM
                     if self.use_ssim_var.get():
+                        ssim_compare_start = time.time()
                         ssim_value = self.calculate_ssim_fast(frame, hist_frame)
+                        ssim_compare_time += time.time() - ssim_compare_start
+
                         if ssim_value >= ssim_threshold:
                             best_match_idx = i
                             best_match_reason = f"哈希({hash_diff})和SSIM({ssim_value:.3f})匹配"
@@ -1337,26 +1384,43 @@ class APISRVideoProcessor:
                         break
             # 如果只使用SSIM检测
             elif self.use_ssim_var.get() and current_thumbnail is not None and hist_thumbnail is not None:
+                ssim_compare_start = time.time()
                 ssim_value = self.calculate_ssim_fast(frame, hist_frame)
+                ssim_compare_time += time.time() - ssim_compare_start
+
                 if ssim_value >= ssim_threshold:
                     best_match_idx = i
                     best_match_reason = f"SSIM匹配({ssim_value:.3f})"
                     best_ssim_value = ssim_value
                     break
 
+        compare_time = time.time() - compare_start
+
         if best_match_idx >= 0:
             # 找到匹配的帧
             matched_sr_result = self.frame_sr_history[best_match_idx]
             matched_frame_idx = self.frame_idx_history[best_match_idx]
 
-            # 详细日志输出
-            history_size = len(self.frame_history)
-            log_message = f"帧 {frame_idx:04d}: 与历史帧 {matched_frame_idx:04d} 匹配"
-            if best_hash_diff is not None:
-                log_message += f", 哈希差异: {best_hash_diff}"
-            if best_ssim_value is not None:
-                log_message += f", SSIM: {best_ssim_value:.4f}"
-            log_message += f", 历史缓存: {history_size} 帧"
+            # 详细计时信息
+            total_elapsed = time.time() - start_time
+            timing_info = []
+            if hash_time > 0:
+                timing_info.append(f"哈希计算: {hash_time:.3f}s")
+            if ssim_thumbnail_time > 0:
+                timing_info.append(f"缩略图: {ssim_thumbnail_time:.3f}s")
+            if hash_compare_time > 0:
+                timing_info.append(f"哈希比较: {hash_compare_time:.3f}s")
+            if ssim_compare_time > 0:
+                timing_info.append(f"SSIM比较: {ssim_compare_time:.3f}s")
+
+            timing_str = f" 计时: {total_elapsed:.3f}s ({', '.join(timing_info)})"
+
+            # 简化日志输出
+            log_message = f"帧 {frame_idx:04d}: 与帧 {matched_frame_idx:04d} 重复"
+            if self.enable_history_var.get():
+                log_message += f" (历史帧: {history_size})"
+            log_message += timing_str
+
             self.log(log_message)
 
             self.dup_frame_count += 1
@@ -1391,20 +1455,33 @@ class APISRVideoProcessor:
 
             return True, matched_sr_result.copy(), current_hash, current_thumbnail
 
-        # 如果没有找到匹配帧，也输出日志
+        # 如果没有找到匹配帧，也输出日志（仅当启用详细日志时）
         else:
-            history_size = len(self.frame_history)
-            log_message = f"帧 {frame_idx:04d}: 未发现重复"
-            if self.enable_history_var.get():
-                log_message += f", 已检查 {history_size} 个历史帧"
-            else:
-                log_message += ", 历史帧功能已禁用"
-            self.log(log_message)
+            total_elapsed = time.time() - start_time
+            if total_elapsed > 0.05:  # 只记录耗时较长的检测
+                timing_info = []
+                if hash_time > 0:
+                    timing_info.append(f"哈希计算: {hash_time:.3f}s")
+                if ssim_thumbnail_time > 0:
+                    timing_info.append(f"缩略图: {ssim_thumbnail_time:.3f}s")
+                if compare_time > 0:
+                    timing_info.append(f"比较: {compare_time:.3f}s")
+
+                timing_str = f" 计时: {total_elapsed:.3f}s ({', '.join(timing_info)})"
+
+                log_message = f"帧 {frame_idx:04d}: 未重复"
+                if self.enable_history_var.get():
+                    log_message += f" (历史帧: {history_size})"
+                log_message += timing_str
+
+                self.log(log_message)
 
         return False, None, current_hash, current_thumbnail
 
     def add_frame_to_history(self, frame, frame_hash, frame_thumbnail, sr_result, frame_idx):
         """添加帧到历史记录"""
+        start_time = time.time()
+
         # 添加帧数据
         self.frame_history.append(frame.copy())
         self.frame_hash_history.append(frame_hash)
@@ -1414,12 +1491,18 @@ class APISRVideoProcessor:
         self.frame_sr_history.append(sr_result.copy() if sr_result is not None else None)
         self.frame_idx_history.append(frame_idx)
 
+        elapsed = time.time() - start_time
+        if elapsed > 0.01:  # 只记录耗时较长的添加操作
+            self.log(f"添加到历史缓存耗时: {elapsed:.3f}秒")
+
     # ============================================================
     # 视频处理函数
     # ============================================================
 
     def extract_audio(self, video_path, audio_path):
         """提取音频"""
+        start_time = time.time()
+
         cmd = [
             'ffmpeg', '-y',
             '-i', video_path,
@@ -1431,6 +1514,9 @@ class APISRVideoProcessor:
 
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+            elapsed = time.time() - start_time
+            self.log(f"音频提取耗时: {elapsed:.2f}秒")
             return True
         except subprocess.CalledProcessError as e:
             self.log(f"提取音频失败: {e.stderr}")
@@ -1439,6 +1525,7 @@ class APISRVideoProcessor:
     def split_video_by_keyframes(self, video_path, segment_duration, output_dir):
         """按关键帧分割视频"""
         self.log(f"开始分割视频: {os.path.basename(video_path)}")
+        start_time = time.time()
 
         segments = []
 
@@ -1470,13 +1557,14 @@ class APISRVideoProcessor:
                 if f.startswith("segment_") and f.endswith(".mp4"):
                     segment_file = os.path.join(segment_dir, f)
                     segments.append(segment_file)
-                    self.log(f"创建分段 {len(segments)}: {f}")
+
+            elapsed = time.time() - start_time
+            self.log(f"视频分割完成，共{len(segments)}段，耗时: {elapsed:.2f}秒")
 
         except subprocess.CalledProcessError as e:
             self.log(f"视频分割失败: {e.stderr}")
             return []
 
-        self.log(f"视频分割完成，共{len(segments)}段")
         return segments
 
     def load_model(self):
@@ -1533,10 +1621,19 @@ class APISRVideoProcessor:
 
     def process_single_frame(self, frame):
         """处理单帧图像"""
+        start_time = time.time()
+
         if self.test_mode_var.get():
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # 测试模式不处理，直接返回RGB格式
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            elapsed = time.time() - start_time
+            if elapsed > 0.05:
+                self.log(f"测试模式帧处理耗时: {elapsed:.3f}秒")
+            return frame_rgb
 
         from torchvision.transforms import ToTensor
+
+        preprocess_start = time.time()
 
         # 预处理
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1564,17 +1661,26 @@ class APISRVideoProcessor:
             if w % 4 != 0:
                 frame_rgb = frame_rgb[:, :4 * (w // 4), :]
 
+        preprocess_time = time.time() - preprocess_start
+
         # 转换为tensor并进行推理
+        tensor_start = time.time()
         img_tensor = ToTensor()(frame_rgb).unsqueeze(0)
 
         if torch.cuda.is_available():
             img_tensor = img_tensor.cuda()
 
         img_tensor = img_tensor.to(dtype=self.weight_dtype)
+        tensor_time = time.time() - tensor_start
 
+        # 推理
+        inference_start = time.time()
         with torch.no_grad():
             result = self.generator(img_tensor)
+        inference_time = time.time() - inference_start
 
+        # 后处理
+        postprocess_start = time.time()
         # 转换为numpy数组
         result_np = result[0].cpu().detach().numpy()
         result_np = np.transpose(result_np, (1, 2, 0))
@@ -1586,15 +1692,28 @@ class APISRVideoProcessor:
             output_w = int(original_w * scale)
             result_np = cv2.resize(result_np, (output_w, output_h), interpolation=cv2.INTER_LINEAR)
 
+        postprocess_time = time.time() - postprocess_start
+
+        total_elapsed = time.time() - start_time
+
+        # 记录耗时信息（只记录耗时较长的帧）
+        if total_elapsed > 0.2:  # 只记录超过200ms的帧处理
+            self.log(f"帧处理耗时: {total_elapsed:.3f}秒 (预处理: {preprocess_time:.3f}s, "
+                     f"张量化: {tensor_time:.3f}s, 推理: {inference_time:.3f}s, "
+                     f"后处理: {postprocess_time:.3f}s)")
+
         return result_np
 
     def process_frame_with_enhanced_dup_detect(self, frame, frame_idx):
         """处理单帧，包含增强的重复帧检测"""
+        start_time = time.time()
         is_duplicate = False
 
         # 检查是否为重复帧
+        dup_detect_start = time.time()
         is_duplicate, matched_sr_result, current_hash, current_thumbnail = \
             self.check_frame_duplicate_enhanced(frame, frame_idx)
+        dup_detect_time = time.time() - dup_detect_start
 
         if is_duplicate and matched_sr_result is not None:
             # 找到重复帧，直接使用历史超分辨率结果
@@ -1614,12 +1733,20 @@ class APISRVideoProcessor:
 
             self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
 
+            total_elapsed = time.time() - start_time
+            # 记录重复帧的处理总耗时
+            if total_elapsed > 0.1:
+                self.log(f"重复帧处理总耗时: {total_elapsed:.3f}秒 (检测: {dup_detect_time:.3f}s)")
+
             return result_np, current_hash, current_thumbnail, is_duplicate
 
         # 非重复帧，进行超分辨率处理
+        sr_start = time.time()
         result_np = self.process_single_frame(frame)
+        sr_time = time.time() - sr_start
 
         # 计算当前帧的信息
+        info_start = time.time()
         if self.use_hash_var.get() and current_hash is None:
             current_hash = self.calculate_frame_hash(frame)
         if self.use_ssim_var.get() and current_thumbnail is None:
@@ -1630,9 +1757,20 @@ class APISRVideoProcessor:
                 current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             else:
                 current_thumbnail = frame.copy()
+        info_time = time.time() - info_start
 
         # 更新历史记录
+        history_start = time.time()
         self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
+        history_time = time.time() - history_start
+
+        total_elapsed = time.time() - start_time
+
+        # 记录非重复帧的处理总耗时（只记录耗时较长的帧）
+        if total_elapsed > 0.3:  # 只记录超过300ms的帧处理
+            self.log(f"新帧处理总耗时: {total_elapsed:.3f}秒 (检测: {dup_detect_time:.3f}s, "
+                     f"超分: {sr_time:.3f}s, 信息计算: {info_time:.3f}s, "
+                     f"历史更新: {history_time:.3f}s)")
 
         return result_np, current_hash, current_thumbnail, is_duplicate
 
@@ -1642,21 +1780,6 @@ class APISRVideoProcessor:
 
         # 重新初始化历史帧缓存
         self.init_history_cache()
-        self.log("历史帧缓存已重新初始化")
-
-        # 重新加载模型（如果设置改变了）
-        if not self.test_mode_var.get() and self.generator is not None:
-            self.log("重新加载模型以应用新设置...")
-            # 清空GPU内存
-            del self.generator
-            torch.cuda.empty_cache()
-
-            try:
-                self.generator = self.load_model()
-                self.log("模型重新加载成功")
-            except Exception as e:
-                self.log(f"重新加载模型失败: {e}")
-                self.generator = None
 
         # 记录当前设置
         if self.enable_dup_detect_var.get():
@@ -1668,9 +1791,9 @@ class APISRVideoProcessor:
 
             if self.enable_history_var.get():
                 history_size = int(self.history_size_var.get())
-                self.log(f"重复帧检测: {', '.join(methods)}，历史帧数量: {history_size}")
+                self.log(f"重复帧检测: {', '.join(methods)}，历史帧: {history_size}")
             else:
-                self.log(f"重复帧检测: {', '.join(methods)}，历史帧功能: 禁用")
+                self.log(f"重复帧检测: {', '.join(methods)}，仅与前帧比较")
         else:
             self.log("重复帧检测已禁用")
 
@@ -1686,6 +1809,7 @@ class APISRVideoProcessor:
         """处理视频片段的所有帧（逐帧处理）"""
         segment_name = os.path.basename(segment_path)
         self.log(f"处理片段 {segment_index}: {segment_name}")
+        segment_start_time = time.time()
 
         if self.test_mode_var.get():
             self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
@@ -1751,9 +1875,9 @@ class APISRVideoProcessor:
 
             if self.enable_history_var.get():
                 history_size = int(self.history_size_var.get())
-                self.log(f"重复帧检测: {', '.join(methods)}，历史帧功能: 启用(数量:{history_size})")
+                self.log(f"重复帧检测: {', '.join(methods)}，历史帧: {history_size}")
             else:
-                self.log(f"重复帧检测: {', '.join(methods)}，历史帧功能: 禁用")
+                self.log(f"重复帧检测: {', '.join(methods)}，仅与前帧比较")
 
         # 如果从进度恢复，跳过已处理的帧
         start_frame = self.current_frame_in_segment
@@ -1782,6 +1906,11 @@ class APISRVideoProcessor:
         # 初始化帧计数器
         frames_processed = 0
         segment_dup_count = 0  # 当前片段的重复帧数
+
+        # 统计计时
+        total_frame_time = 0
+        total_save_time = 0
+        total_dup_detect_time = 0
 
         while True:
             # 检查是否被停止
@@ -1829,17 +1958,29 @@ class APISRVideoProcessor:
                 break
 
             # 保存原始帧到before目录
+            save_start = time.time()
             before_path = os.path.join(before_dir, f"frame_{frame_idx:06d}.png")
             cv2.imwrite(before_path, frame)
+            save_time = time.time() - save_start
+            total_save_time += save_time
 
             # 使用增强的重复帧检测处理帧
+            process_start = time.time()
             sr_frame, current_hash, current_thumbnail, is_duplicate = \
                 self.process_frame_with_enhanced_dup_detect(frame, frame_idx)
+            frame_process_time = time.time() - process_start
+            total_frame_time += frame_process_time
+
+            if is_duplicate:
+                total_dup_detect_time += frame_process_time
 
             # 保存处理后的帧到after目录
+            after_save_start = time.time()
             after_path = os.path.join(after_dir, f"frame_{frame_idx:06d}.png")
             sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
             cv2.imwrite(after_path, sr_frame_bgr)
+            after_save_time = time.time() - after_save_start
+            total_save_time += after_save_time
 
             # 添加到帧文件列表
             if not self.test_mode_var.get():
@@ -1877,11 +2018,20 @@ class APISRVideoProcessor:
 
         cap.release()
 
-        # 记录重复帧统计
+        # 记录片段处理统计
+        segment_elapsed = time.time() - segment_start_time
+        avg_frame_time = total_frame_time / max(frames_processed, 1)
+        avg_save_time = total_save_time / max(frames_processed, 1)
+
+        self.log(f"片段处理完成: {segment_name}，总耗时: {segment_elapsed:.2f}秒")
+        self.log(f"  处理帧数: {frames_processed}，平均每帧耗时: {avg_frame_time:.3f}秒")
+        self.log(f"  文件保存平均耗时: {avg_save_time:.3f}秒")
+
         if self.enable_dup_detect_var.get():
-            self.log(f"片段处理完成: {segment_name}，检测到 {segment_dup_count} 个重复帧")
-        else:
-            self.log(f"片段处理完成: {segment_name}")
+            self.log(f"  检测到重复帧: {segment_dup_count}个，重复检测总耗时: {total_dup_detect_time:.2f}秒")
+            if segment_dup_count > 0:
+                avg_dup_time = total_dup_detect_time / segment_dup_count
+                self.log(f"  平均每个重复帧检测耗时: {avg_dup_time:.3f}秒")
 
         # 清空历史缓存以释放内存
         self.frame_history.clear()
@@ -1896,6 +2046,7 @@ class APISRVideoProcessor:
     def frames_to_video(self, frame_files, output_path, fps, width, height, audio_path=None):
         """将帧序列转换为视频"""
         self.log(f"正在生成视频: {output_path}")
+        start_time = time.time()
 
         if not frame_files:
             self.log("错误: 没有可用的帧文件")
@@ -1909,6 +2060,7 @@ class APISRVideoProcessor:
         out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
 
         # 按顺序写入所有帧
+        write_start = time.time()
         for frame_file in sorted(frame_files):
             if os.path.exists(frame_file):
                 frame = cv2.imread(frame_file)
@@ -1917,12 +2069,13 @@ class APISRVideoProcessor:
                     if frame.shape[1] != width or frame.shape[0] != height:
                         frame = cv2.resize(frame, (width, height))
                     out.write(frame)
-
+        write_time = time.time() - write_start
         out.release()
 
         # 如果有音频，合并音频和视频
         if audio_path and os.path.exists(audio_path):
             self.log("合并音频和视频...")
+            merge_start = time.time()
 
             # 使用ffmpeg合并
             cmd = [
@@ -1939,11 +2092,15 @@ class APISRVideoProcessor:
 
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
-                self.log("音频视频合并成功")
+                merge_time = time.time() - merge_start
 
                 # 删除临时文件
                 if os.path.exists(temp_video_path):
                     os.remove(temp_video_path)
+
+                total_time = time.time() - start_time
+                self.log(
+                    f"音频视频合并成功，耗时: {total_time:.2f}秒 (写入: {write_time:.2f}s, 合并: {merge_time:.2f}s)")
                 return True
             except subprocess.CalledProcessError as e:
                 self.log(f"音频视频合并失败: {e.stderr}")
@@ -1955,6 +2112,8 @@ class APISRVideoProcessor:
             # 如果没有音频，直接使用临时视频文件
             if os.path.exists(temp_video_path):
                 shutil.move(temp_video_path, output_path)
+                total_time = time.time() - start_time
+                self.log(f"视频生成成功，耗时: {total_time:.2f}秒 (写入: {write_time:.2f}s)")
                 return True
 
         return False
@@ -1962,6 +2121,7 @@ class APISRVideoProcessor:
     def concatenate_videos(self, video_list, output_path):
         """拼接视频片段"""
         self.log("开始拼接视频片段...")
+        start_time = time.time()
 
         # 创建临时文件列表
         list_file = tempfile.mktemp(suffix=".txt")
@@ -1982,7 +2142,9 @@ class APISRVideoProcessor:
 
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-            self.log(f"视频拼接完成: {output_path}")
+
+            elapsed = time.time() - start_time
+            self.log(f"视频拼接完成: {output_path}，耗时: {elapsed:.2f}秒")
             return True
         except subprocess.CalledProcessError as e:
             self.log(f"视频拼接失败: {e.stderr}")
@@ -1996,6 +2158,8 @@ class APISRVideoProcessor:
         if not self.immediate_merge_var.get() or self.test_mode_var.get():
             return None
 
+        start_time = time.time()
+
         # 检查是否已经有合并的视频
         merge_dir = os.path.join(self.temp_base_dir, "06_immediate_merge")
         merged_video_path = os.path.join(merge_dir, f"merged_up_to_{segment_index:03d}.mp4")
@@ -2004,7 +2168,8 @@ class APISRVideoProcessor:
         if segment_index == 0 or not os.path.exists(
                 merged_video_path.replace(f"_{segment_index:03d}.mp4", f"_{segment_index - 1:03d}.mp4")):
             shutil.copy2(processed_segment_path, merged_video_path)
-            self.log(f"立即合成: 创建初始合并视频 {segment_index:03d}")
+            elapsed = time.time() - start_time
+            self.log(f"立即合成: 创建初始合并视频 {segment_index:03d}，耗时: {elapsed:.2f}秒")
             return merged_video_path
 
         # 获取上一个合并的视频
@@ -2034,7 +2199,9 @@ class APISRVideoProcessor:
             ]
 
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-            self.log(f"立即合成: 成功合并片段 {segment_index} 到整体视频")
+
+            elapsed = time.time() - start_time
+            self.log(f"立即合成: 成功合并片段 {segment_index} 到整体视频，耗时: {elapsed:.2f}秒")
 
             # 删除上一个合并视频以节省空间
             if os.path.exists(prev_merged_video):
@@ -2054,6 +2221,7 @@ class APISRVideoProcessor:
         try:
             self.log(
                 f"开始处理视频 {self.current_video_index + 1}/{len(self.input_paths)}: {os.path.basename(video_path)}")
+            video_start_time = time.time()
 
             # 设置视频基础名称
             self.video_base_name = Path(video_path).stem
@@ -2124,7 +2292,10 @@ class APISRVideoProcessor:
             if not self.test_mode_var.get():
                 self.log("步骤1: 加载模型...")
                 self.update_progress(0)
+                model_load_start = time.time()
                 self.generator = self.load_model()
+                model_load_time = time.time() - model_load_start
+                self.log(f"模型加载完成，耗时: {model_load_time:.2f}秒")
                 self.update_progress(5)
             else:
                 self.log("测试模式：跳过模型加载")
@@ -2134,8 +2305,12 @@ class APISRVideoProcessor:
             if not self.segments or self.current_segment_index == 0:
                 self.log("步骤2: 分割视频...")
                 segment_duration = float(self.segment_duration.get())
+                split_start = time.time()
                 self.segments = self.split_video_by_keyframes(video_path, segment_duration, temp_dirs['base'])
+                split_time = time.time() - split_start
+
                 self.total_segments = len(self.segments)
+                self.log(f"视频分割完成，共{len(self.segments)}段，耗时: {split_time:.2f}秒")
                 self.update_progress(10)
 
                 if not self.segments:
@@ -2158,6 +2333,9 @@ class APISRVideoProcessor:
             all_processed_frames = []
             all_audio_paths = []
 
+            total_segment_time = 0
+            total_frames_processed = 0
+
             for i in range(self.current_segment_index, len(self.segments)):
                 # 检查是否被停止
                 if self.stopped:
@@ -2176,7 +2354,10 @@ class APISRVideoProcessor:
                     continue
 
                 self.log(f"处理片段 {i + 1}/{len(self.segments)}: {segment_name}")
+                segment_start = time.time()
                 frame_files, audio_path = self.process_segment_frames(segment, i + 1)
+                segment_time = time.time() - segment_start
+                total_segment_time += segment_time
 
                 # 检查是否被停止
                 if self.stopped:
@@ -2268,10 +2449,13 @@ class APISRVideoProcessor:
                         # 将最终合并视频移动到输出目录
                         output_filename = f"{self.video_base_name}_super_resolved.mp4"
                         final_output = os.path.join(self.output_dir.get(), output_filename)
+
+                        merge_start = time.time()
                         shutil.copy2(latest_merged, final_output)
+                        merge_time = time.time() - merge_start
 
                         self.update_progress(95)
-                        self.log(f"使用立即合成的视频作为最终输出: {final_output}")
+                        self.log(f"使用立即合成的视频作为最终输出: {final_output}，复制耗时: {merge_time:.2f}秒")
 
                         # 清理立即合成目录
                         shutil.rmtree(merge_dir)
@@ -2286,15 +2470,17 @@ class APISRVideoProcessor:
                                 processed_segments_paths.append(processed_path)
 
                         if processed_segments_paths:
+                            output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                            final_output = os.path.join(self.output_dir.get(), output_filename)
+
                             if len(processed_segments_paths) > 1:
-                                output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                                final_output = os.path.join(self.output_dir.get(), output_filename)
                                 self.concatenate_videos(processed_segments_paths, final_output)
                             else:
                                 # 如果只有一个片段，直接复制
-                                output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                                final_output = os.path.join(self.output_dir.get(), output_filename)
+                                copy_start = time.time()
                                 shutil.copy2(processed_segments_paths[0], final_output)
+                                copy_time = time.time() - copy_start
+                                self.log(f"复制单个片段，耗时: {copy_time:.2f}秒")
 
                             self.update_progress(95)
                             self.log(f"最终输出文件: {final_output}")
@@ -2310,15 +2496,17 @@ class APISRVideoProcessor:
                             processed_segments_paths.append(processed_path)
 
                     if processed_segments_paths:
+                        output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                        final_output = os.path.join(self.output_dir.get(), output_filename)
+
                         if len(processed_segments_paths) > 1:
-                            output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                            final_output = os.path.join(self.output_dir.get(), output_filename)
                             self.concatenate_videos(processed_segments_paths, final_output)
                         else:
                             # 如果只有一个片段，直接复制
-                            output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                            final_output = os.path.join(self.output_dir.get(), output_filename)
+                            copy_start = time.time()
                             shutil.copy2(processed_segments_paths[0], final_output)
+                            copy_time = time.time() - copy_start
+                            self.log(f"复制单个片段，耗时: {copy_time:.2f}秒")
 
                         self.update_progress(95)
                         self.log(f"最终输出文件: {final_output}")
@@ -2337,13 +2525,20 @@ class APISRVideoProcessor:
 
             self.update_progress(100)
 
+            # 视频处理完成统计
+            total_video_time = time.time() - video_start_time
+            avg_frame_time = total_segment_time / max(total_frames_processed, 1) if total_frames_processed > 0 else 0
+
             if self.test_mode_var.get():
-                self.log("测试模式完成！")
+                self.log(f"测试模式完成！总耗时: {total_video_time:.2f}秒")
                 self.log(f"重复帧检测统计：总计检测到 {self.dup_frame_count} 个重复帧")
                 self.log(f"测试结果保存在: {temp_dirs['base']}")
                 # 测试模式下不删除临时文件，供用户查看结果
             else:
-                self.log(f"处理完成！输出文件: {self.video_base_name}_super_resolved.mp4")
+                self.log(f"处理完成！总耗时: {total_video_time:.2f}秒")
+                self.log(f"输出文件: {self.video_base_name}_super_resolved.mp4")
+                if total_frames_processed > 0:
+                    self.log(f"平均每帧处理时间: {avg_frame_time:.3f}秒")
                 # 显示重复帧统计
                 if self.enable_dup_detect_var.get():
                     self.log(f"总计检测到 {self.dup_frame_count} 个重复帧，已复用处理结果，加速了处理速度")

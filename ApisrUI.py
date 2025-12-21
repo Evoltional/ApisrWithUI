@@ -200,8 +200,11 @@ class APISRVideoProcessor:
                 self.direct_mode = True
                 self.log("已切换到直接处理视频模式")
 
-                # 清空当前未完成的逐帧处理任务
+                # 清理当前未完成的逐帧处理任务
                 self.cleanup_current_frame_tasks()
+
+                # 重置当前片段的进度，以便重新处理
+                self.reset_current_segment_progress()
 
                 # 更新UI状态
                 self.update_ui_for_direct_mode()
@@ -215,6 +218,9 @@ class APISRVideoProcessor:
                 # 从直接模式切换回逐帧模式
                 self.direct_mode = False
                 self.log("已切换回逐帧处理模式（带重复帧检测）")
+
+                # 重置当前片段的进度，以便重新处理
+                self.reset_current_segment_progress()
 
                 # 更新UI状态
                 self.update_ui_for_frame_mode()
@@ -248,6 +254,267 @@ class APISRVideoProcessor:
             self.update_dup_info(0)
 
             self.log("已清空当前未完成的逐帧处理任务")
+
+    def reset_current_segment_progress(self):
+        """重置当前片段的进度，以便重新处理"""
+        if self.processing:
+            self.log("重置当前片段进度，以便重新处理...")
+
+            # 清理当前片段的临时文件
+            if self.temp_base_dir and os.path.exists(self.temp_base_dir):
+                # 清理当前片段的帧目录（如果是逐帧模式）
+                if not self.direct_mode and self.current_segment_index > 0:
+                    self.cleanup_segment_frame_dirs(self.current_segment_index)
+
+                # 清理当前片段的已处理视频文件
+                processed_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
+                if os.path.exists(processed_dir):
+                    segment_name = f"segment_{self.current_segment_index:03d}"
+                    for file in os.listdir(processed_dir):
+                        if segment_name in file:
+                            file_path = os.path.join(processed_dir, file)
+                            try:
+                                os.remove(file_path)
+                                self.log(f"已删除已处理的片段文件: {file}")
+                            except Exception as e:
+                                self.log(f"删除文件失败: {file}, 错误: {e}")
+
+                # 从已处理列表中移除当前片段
+                if self.current_segment_index > 0 and self.segments:
+                    segment_path = self.segments[self.current_segment_index - 1]
+                    segment_name = os.path.basename(segment_path)
+                    if segment_name in self.processed_segments:
+                        self.processed_segments.remove(segment_name)
+                        self.log(f"已从已处理列表中移除: {segment_name}")
+
+            # 重置当前片段的帧计数器
+            self.current_frame_in_segment = 0
+
+            # 重新读取进度文件（如果有）
+            self.read_progress_file()
+
+    def read_progress_file(self):
+        """读取进度文件，获取当前处理状态"""
+        if not self.temp_base_dir or not os.path.exists(self.temp_base_dir):
+            return
+
+        progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'rb') as f:
+                    progress_data = pickle.load(f)
+
+                # 更新进度信息
+                self.current_video_index = progress_data.get('current_video_index', 0)
+                self.current_segment_index = progress_data.get('current_segment_index', 0)
+                self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
+                self.total_segments = progress_data.get('total_segments', 0)
+                self.segments = progress_data.get('segments', [])
+                self.processed_segments = progress_data.get('processed_segments', [])
+
+                self.log(f"已读取进度: 视频 {self.current_video_index + 1} - 片段 {self.current_segment_index + 1}")
+
+            except Exception as e:
+                self.log(f"读取进度文件时出错: {e}")
+
+    def detect_actual_progress(self):
+        """检测实际的进度（基于临时文件夹中的文件名）"""
+        if not self.temp_base_dir or not os.path.exists(self.temp_base_dir):
+            return None
+
+        self.log("开始检测实际进度（基于文件名）...")
+
+        detected_segments = []
+        detected_processed_segments = []
+        detected_current_segment_index = 0
+        detected_current_frame_in_segment = 0
+        detected_total_segments = 0
+
+        # 1. 获取片段总数（从01_original_segments目录）
+        segments_dir = os.path.join(self.temp_base_dir, "01_original_segments")
+        if os.path.exists(segments_dir):
+            segment_files = []
+            for f in os.listdir(segments_dir):
+                if f.startswith("segment_") and f.endswith(".mp4"):
+                    segment_files.append(os.path.join(segments_dir, f))
+
+            # 按文件名排序
+            segment_files.sort()
+            detected_total_segments = len(segment_files)
+
+            # 构建segments列表
+            detected_segments = segment_files
+
+            self.log(f"检测到 {detected_total_segments} 个原始片段")
+
+        # 2. 检测已处理的片段（从04_processed_segments目录，基于文件名）
+        processed_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
+        if os.path.exists(processed_dir):
+            processed_files = []
+            for f in os.listdir(processed_dir):
+                if f.startswith("processed_") and f.endswith(".mp4"):
+                    processed_files.append(f)
+
+            # 按文件名排序
+            processed_files.sort()
+
+            # 从文件名提取原始片段名
+            for processed_file in processed_files:
+                # 提取原始片段名（去掉processed_前缀）
+                original_name = processed_file.replace("processed_", "")
+                detected_processed_segments.append(original_name)
+
+            # 根据文件名找出最后一个已处理的片段索引
+            if processed_files:
+                # 提取最后一个处理文件的片段编号
+                last_processed = processed_files[-1]
+                # 格式如：processed_segment_001.mp4
+                try:
+                    # 提取数字部分
+                    import re
+                    match = re.search(r'segment_(\d+)', last_processed)
+                    if match:
+                        last_index = int(match.group(1)) - 1  # 转换为0-based索引
+                        # 设置下一个要处理的片段索引
+                        detected_current_segment_index = last_index + 1
+                        detected_current_frame_in_segment = 0  # 新片段从第0帧开始
+                        self.log(
+                            f"根据文件名检测到最后一个已处理片段: {last_processed}, 下一个片段索引: {detected_current_segment_index}")
+                except Exception as e:
+                    self.log(f"解析处理文件名时出错: {e}")
+
+            self.log(f"检测到 {len(detected_processed_segments)} 个已处理片段")
+
+        # 3. 检测当前处理进度（从03_segment_frames目录，基于after文件夹和帧文件名）
+        frames_dir = os.path.join(self.temp_base_dir, "03_segment_frames")
+        if os.path.exists(frames_dir):
+            # 查找所有after文件夹
+            after_dirs = []
+            for item in os.listdir(frames_dir):
+                item_path = os.path.join(frames_dir, item)
+                if os.path.isdir(item_path) and item.endswith("_after"):
+                    after_dirs.append((item_path, item))
+
+            if after_dirs:
+                # 按文件夹名中的片段索引排序
+                after_dirs.sort(key=lambda x: self.extract_segment_index_from_dirname(x[1]))
+
+                # 处理每个after文件夹
+                for after_dir, dir_name in after_dirs:
+                    try:
+                        # 从文件夹名提取片段索引
+                        segment_idx = self.extract_segment_index_from_dirname(dir_name)
+
+                        # 检查该片段是否在已处理片段列表中
+                        segment_name = f"segment_{segment_idx:03d}.mp4"
+                        if segment_name in detected_processed_segments:
+                            # 如果片段已处理，跳过
+                            continue
+
+                        # 检查文件夹中是否有帧文件
+                        if os.path.exists(after_dir):
+                            frame_files = [f for f in os.listdir(after_dir)
+                                           if f.startswith("frame_") and f.endswith(".png")]
+
+                            if frame_files:
+                                # 按文件名排序
+                                frame_files.sort()
+
+                                # 从最后一个文件名提取最大帧号
+                                last_frame_file = frame_files[-1]
+                                try:
+                                    # 提取帧号（格式：frame_000001.png）
+                                    frame_num = int(last_frame_file.split('_')[1].split('.')[0])
+                                    detected_current_segment_index = segment_idx - 1  # 转换为0-based
+                                    detected_current_frame_in_segment = frame_num + 1  # 下一帧的索引
+                                    self.log(f"根据帧文件名检测到片段 {segment_idx} 已处理 {frame_num + 1} 帧")
+
+                                    # 如果有多个after文件夹，只保留最新的（最大的片段索引）
+                                    break  # 只处理最新的after文件夹
+                                except Exception as e:
+                                    self.log(f"解析帧文件名时出错: {e}")
+                    except Exception as e:
+                        self.log(f"处理after文件夹时出错: {e}")
+
+        # 4. 如果没有检测到after文件夹，但已处理片段存在，设置下一个要处理的片段
+        if detected_current_segment_index == 0 and detected_processed_segments:
+            # 找出最大的已处理片段索引
+            max_processed_index = 0
+            for processed_name in detected_processed_segments:
+                try:
+                    # 格式如：segment_001.mp4
+                    import re
+                    match = re.search(r'segment_(\d+)', processed_name)
+                    if match:
+                        index = int(match.group(1))
+                        if index > max_processed_index:
+                            max_processed_index = index
+                except:
+                    pass
+
+            if max_processed_index > 0:
+                # 设置下一个要处理的片段
+                detected_current_segment_index = max_processed_index  # 已经是1-based
+                detected_current_frame_in_segment = 0
+                self.log(f"根据已处理片段文件名，设置下一个要处理的片段为: {detected_current_segment_index}")
+
+        # 构建检测结果
+        detected_progress = {
+            'current_segment_index': detected_current_segment_index,
+            'current_frame_in_segment': detected_current_frame_in_segment,
+            'total_segments': detected_total_segments,
+            'segments': detected_segments,
+            'processed_segments': detected_processed_segments,
+            'detected_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        self.log(f"进度检测完成: 片段 {detected_current_segment_index}, 帧 {detected_current_frame_in_segment}")
+        return detected_progress
+
+    def extract_segment_index_from_dirname(self, dir_name):
+        """从文件夹名中提取片段索引"""
+        try:
+            # 格式如：segment_001_after 或 segment_1_after
+            import re
+            match = re.search(r'segment_(\d+)', dir_name)
+            if match:
+                return int(match.group(1))
+            return 0
+        except:
+            return 0
+
+    def compare_progress(self, saved_progress, detected_progress):
+        """比较保存的进度和检测到的进度"""
+        differences = []
+
+        # 检查总片段数
+        if saved_progress.get('total_segments', 0) != detected_progress.get('total_segments', 0):
+            differences.append(
+                f"总片段数: 保存的={saved_progress.get('total_segments', 0)}, 检测的={detected_progress.get('total_segments', 0)}")
+
+        # 检查当前片段索引
+        if saved_progress.get('current_segment_index', 0) != detected_progress.get('current_segment_index', 0):
+            differences.append(
+                f"当前片段: 保存的={saved_progress.get('current_segment_index', 0)}, 检测的={detected_progress.get('current_segment_index', 0)}")
+
+        # 检查当前帧索引
+        if saved_progress.get('current_frame_in_segment', 0) != detected_progress.get('current_frame_in_segment', 0):
+            differences.append(
+                f"当前帧: 保存的={saved_progress.get('current_frame_in_segment', 0)}, 检测的={detected_progress.get('current_frame_in_segment', 0)}")
+
+        # 检查已处理片段数
+        saved_processed = len(saved_progress.get('processed_segments', []))
+        detected_processed = len(detected_progress.get('processed_segments', []))
+        if saved_processed != detected_processed:
+            differences.append(f"已处理片段数: 保存的={saved_processed}, 检测的={detected_processed}")
+
+        # 检查具体的已处理片段
+        saved_set = set(saved_progress.get('processed_segments', []))
+        detected_set = set(detected_progress.get('processed_segments', []))
+        if saved_set != detected_set:
+            differences.append("已处理片段列表不一致")
+
+        return differences
 
     def update_ui_for_direct_mode(self):
         """更新UI为直接处理模式"""
@@ -1876,9 +2143,9 @@ class APISRVideoProcessor:
 
         # 计算当前帧的信息
         info_start = time.time()
-        if self.use_hash_var.get() and current_hash is None:
+        if current_hash is None and self.use_hash_var.get():
             current_hash = self.calculate_frame_hash(frame)
-        if self.use_ssim_var.get() and current_thumbnail is None:
+        if current_thumbnail is None and self.use_ssim_var.get():
             h, w = frame.shape[:2]
             if h > 180 or w > 320:
                 new_h = 180
@@ -2504,76 +2771,101 @@ class APISRVideoProcessor:
             if self.is_test_mode_folder:
                 self.log("注意：当前为测试模式文件夹")
 
+            # 测试模式不保存进度，所以不进行进度检测
             if self.test_mode_var.get():
-                self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
+                self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理，不保存进度")
+                # 重置进度
+                self.current_segment_index = 0
+                self.current_frame_in_segment = 0
+                self.total_segments = 0
+                self.segments = []
+                self.processed_segments = []
+                self.dup_frame_count = 0
+                self.update_dup_info(self.dup_frame_count)
+            else:
+                # 非测试模式：检查进度文件
+                progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
 
-            # 重置重复帧计数（每个视频开始时重置）
-            self.dup_frame_count = 0
-            self.update_dup_info(self.dup_frame_count)
+                if os.path.exists(progress_file):
+                    try:
+                        with open(progress_file, 'rb') as f:
+                            saved_progress = pickle.load(f)
 
-            # 检查是否有该视频的进度数据
-            progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+                        # 检测实际进度
+                        detected_progress = self.detect_actual_progress()
 
-            if os.path.exists(progress_file):
-                try:
-                    with open(progress_file, 'rb') as f:
-                        progress_data = pickle.load(f)
+                        if detected_progress:
+                            # 比较进度差异
+                            differences = self.compare_progress(saved_progress, detected_progress)
 
-                    # 检查是否是从测试模式恢复的进度
-                    saved_test_mode = progress_data.get('is_test_mode_folder', False)
-                    if saved_test_mode != self.is_test_mode_folder:
-                        self.log(
-                            f"警告：进度文件的测试模式状态({saved_test_mode})与当前设置({self.is_test_mode_folder})不匹配")
-                        if self.is_test_mode_folder:
-                            self.log("当前为测试模式，将忽略测试模式的进度文件")
-                            # 删除测试模式的进度文件
-                            os.remove(progress_file)
-                            self.log("已删除测试模式进度文件")
-                        else:
-                            # 正常模式下发现测试模式进度文件
-                            response = messagebox.askyesno("发现测试模式进度",
-                                                           "发现测试模式的进度文件，是否删除并重新开始？")
-                            if response:
-                                os.remove(progress_file)
-                                self.log("已删除测试模式进度文件，重新开始处理")
+                            if differences:
+                                # 进度不一致，询问用户使用哪个进度
+                                diff_text = "\n".join(differences[:5])  # 只显示前5个差异
+                                if len(differences) > 5:
+                                    diff_text += f"\n...还有{len(differences) - 5}个差异"
+
+                                response = messagebox.askyesno("进度不一致检测",
+                                                               f"检测到保存的进度与实际文件进度不一致！\n\n"
+                                                               f"差异:\n{diff_text}\n\n"
+                                                               f"保存的进度：\n"
+                                                               f"  片段: {saved_progress.get('current_segment_index', 0)}\n"
+                                                               f"  帧: {saved_progress.get('current_frame_in_segment', 0)}\n"
+                                                               f"  已处理片段: {len(saved_progress.get('processed_segments', []))}\n\n"
+                                                               f"检测到的进度：\n"
+                                                               f"  片段: {detected_progress.get('current_segment_index', 0)}\n"
+                                                               f"  帧: {detected_progress.get('current_frame_in_segment', 0)}\n"
+                                                               f"  已处理片段: {len(detected_progress.get('processed_segments', []))}\n\n"
+                                                               f"是否使用检测到的进度继续处理？（选择'是'使用检测进度，'否'使用保存进度）")
+
+                                if response:
+                                    # 使用检测到的进度
+                                    self.current_segment_index = detected_progress.get('current_segment_index', 0)
+                                    self.current_frame_in_segment = detected_progress.get('current_frame_in_segment', 0)
+                                    self.total_segments = detected_progress.get('total_segments', 0)
+                                    self.segments = detected_progress.get('segments', [])
+                                    self.processed_segments = detected_progress.get('processed_segments', [])
+                                    self.log("已使用检测到的进度")
+                                else:
+                                    # 使用保存的进度
+                                    self.current_segment_index = saved_progress.get('current_segment_index', 0)
+                                    self.current_frame_in_segment = saved_progress.get('current_frame_in_segment', 0)
+                                    self.total_segments = saved_progress.get('total_segments', 0)
+                                    self.segments = saved_progress.get('segments', [])
+                                    self.processed_segments = saved_progress.get('processed_segments', [])
+                                    self.log("已使用保存的进度")
                             else:
-                                self.log("使用测试模式进度继续处理")
-
-                    # 检查处理模式是否一致
-                    saved_direct_mode = progress_data.get('direct_mode', False)
-                    if saved_direct_mode != self.direct_mode:
-                        self.log(f"警告：进度文件的处理模式({saved_direct_mode})与当前设置({self.direct_mode})不匹配")
-                        if self.direct_mode:
-                            self.log("当前为直接处理模式，将忽略逐帧处理的进度文件")
-                            # 删除进度文件
-                            os.remove(progress_file)
-                            self.log("已删除逐帧处理进度文件")
+                                # 进度一致，使用保存的进度
+                                self.current_segment_index = saved_progress.get('current_segment_index', 0)
+                                self.current_frame_in_segment = saved_progress.get('current_frame_in_segment', 0)
+                                self.total_segments = saved_progress.get('total_segments', 0)
+                                self.segments = saved_progress.get('segments', [])
+                                self.processed_segments = saved_progress.get('processed_segments', [])
+                                self.log("进度一致，使用保存的进度")
                         else:
-                            response = messagebox.askyesno("发现直接处理模式进度",
-                                                           "发现直接处理模式的进度文件，是否删除并重新开始逐帧处理？")
-                            if response:
-                                os.remove(progress_file)
-                                self.log("已删除直接处理模式进度文件，重新开始逐帧处理")
-                            else:
-                                self.log("使用直接处理模式进度继续处理")
+                            # 无法检测到实际进度，使用保存的进度
+                            self.current_segment_index = saved_progress.get('current_segment_index', 0)
+                            self.current_frame_in_segment = saved_progress.get('current_frame_in_segment', 0)
+                            self.total_segments = saved_progress.get('total_segments', 0)
+                            self.segments = saved_progress.get('segments', [])
+                            self.processed_segments = saved_progress.get('processed_segments', [])
+                            self.log("使用保存的进度（无法检测实际进度）")
 
-                    # 恢复进度
-                    self.current_segment_index = progress_data.get('current_segment_index', 0)
-                    self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
-                    self.total_segments = progress_data.get('total_segments', 0)
-                    self.segments = progress_data.get('segments', [])
-                    self.processed_segments = progress_data.get('processed_segments', [])
-                    # 注意：不恢复dup_frame_count，已重置为0
-
-                    self.log(
-                        f"恢复进度: 片段 {self.current_segment_index + 1}/{self.total_segments} 的第 {self.current_frame_in_segment + 1} 帧")
-                    self.log(f"重复帧计数已重置")
-                except Exception as e:
-                    self.log(f"加载进度数据时出错: {e}")
+                    except Exception as e:
+                        self.log(f"加载进度数据时出错: {e}")
+                        self.current_segment_index = 0
+                        self.current_frame_in_segment = 0
+                        self.processed_segments = []
+                        self.dup_frame_count = 0
+                else:
+                    # 没有进度文件，从头开始
                     self.current_segment_index = 0
                     self.current_frame_in_segment = 0
                     self.processed_segments = []
                     self.dup_frame_count = 0
+
+            # 重置重复帧计数（每个视频开始时重置）
+            self.dup_frame_count = 0
+            self.update_dup_info(self.dup_frame_count)
 
             # 步骤1: 加载模型
             if not self.test_mode_var.get():
@@ -2612,7 +2904,8 @@ class APISRVideoProcessor:
                 self.update_progress(10)
 
             # 保存初始进度
-            self.save_progress(force=True)
+            if not self.test_mode_var.get():
+                self.save_progress(force=True)
 
             # 步骤3: 处理视频片段
             self.log("步骤3: 处理视频片段...")
@@ -2625,7 +2918,8 @@ class APISRVideoProcessor:
                 # 检查是否被停止
                 if self.stopped:
                     self.log(f"处理被用户停止于片段 {i + 1}")
-                    self.save_progress(force=True)
+                    if not self.test_mode_var.get():
+                        self.save_progress(force=True)
                     break
 
                 segment = self.segments[i]
@@ -2682,7 +2976,8 @@ class APISRVideoProcessor:
 
                 # 检查是否被停止
                 if self.stopped:
-                    self.save_progress(force=True)
+                    if not self.test_mode_var.get():
+                        self.save_progress(force=True)
                     break
 
                 if not self.test_mode_var.get() and processed_segment_path:
@@ -2702,11 +2997,12 @@ class APISRVideoProcessor:
                 self.processed_segments.append(segment_name)
                 self.update_progress_info()
 
-                # 保存进度
-                self.save_progress(force=True)
+                # 保存进度（非测试模式）
+                if not self.test_mode_var.get():
+                    self.save_progress(force=True)
 
                 # 清理当前片段的帧目录（如果是逐帧处理模式）
-                if not self.direct_mode:
+                if not self.direct_mode and not self.test_mode_var.get():
                     self.log(f"清理片段 {i + 1} 的临时帧文件...")
                     self.cleanup_segment_frame_dirs(i + 1)
 
@@ -2719,9 +3015,10 @@ class APISRVideoProcessor:
                     torch.cuda.empty_cache()
 
             if self.stopped:
-                self.log(
-                    f"处理已停止，进度已保存于片段 {self.current_segment_index} 的第 {self.current_frame_in_segment} 帧")
-                self.save_progress(force=True)
+                if not self.test_mode_var.get():
+                    self.log(
+                        f"处理已停止，进度已保存于片段 {self.current_segment_index} 的第 {self.current_frame_in_segment} 帧")
+                    self.save_progress(force=True)
                 return False
 
             # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
@@ -2803,9 +3100,11 @@ class APISRVideoProcessor:
             # 步骤5: 清理临时文件和进度记录
             self.log("步骤5: 清理临时文件...")
 
-            # 删除进度文件
-            if os.path.exists(progress_file):
-                os.remove(progress_file)
+            # 删除进度文件（非测试模式）
+            if not self.test_mode_var.get():
+                progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+                if os.path.exists(progress_file):
+                    os.remove(progress_file)
 
             self.update_progress(100)
 
@@ -2850,8 +3149,9 @@ class APISRVideoProcessor:
 
         except Exception as e:
             self.log(f"处理视频失败: {str(e)}")
-            # 保存进度以便恢复
-            self.save_progress(force=True)
+            # 保存进度以便恢复（非测试模式）
+            if not self.test_mode_var.get():
+                self.save_progress(force=True)
             return False
 
     def process_videos(self):

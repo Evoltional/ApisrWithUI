@@ -1,3 +1,5 @@
+import collections
+import json
 import os
 import pickle
 import shutil
@@ -8,18 +10,16 @@ import threading
 import time
 import tkinter as tk
 import warnings
-import collections
-import json
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 import cv2
+import imagehash
 import numpy as np
 import torch
 from PIL import Image
-import imagehash
 from skimage.metrics import structural_similarity as ssim
 
 warnings.filterwarnings('ignore')
@@ -38,6 +38,8 @@ except ImportError as e:
     print("请确保architecture模块在Python路径中")
     sys.exit(1)
 
+from moviepy import VideoFileClip
+from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
 
 class ModernButton(ttk.Button):
     """现代化按钮样式"""
@@ -1133,9 +1135,7 @@ class APISRVideoProcessor:
 4. 历史帧数量可配置
 5. 配置自动保存
 6. 测试模式有确认窗口
-7. 可立即合成视频
-8. 新增性能计时功能
-9. 直接处理模式速度更快"""
+7. 可立即合成视频"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -2440,7 +2440,7 @@ class APISRVideoProcessor:
         return frame_files, audio_path
 
     def frames_to_video(self, frame_files, output_path, fps, width, height, audio_path=None):
-        """将帧序列转换为视频"""
+        """将帧序列转换为视频（修复版）"""
         self.log(f"正在生成视频: {output_path}")
         start_time = time.time()
 
@@ -2451,103 +2451,266 @@ class APISRVideoProcessor:
         # 创建临时视频文件（无音频）
         temp_video_path = output_path.replace('.mp4', '_temp.mp4')
 
-        # 创建视频写入器
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # 使用更可靠的编码器
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # 使用H.264编码器
         out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+
+        if not out.isOpened():
+            self.log("错误: 无法创建视频写入器，尝试其他编码器")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 使用MPEG-4编码器
+            out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+            if not out.isOpened():
+                self.log("错误: 仍然无法创建视频写入器")
+                return False
 
         # 按顺序写入所有帧
         write_start = time.time()
+        frame_count = 0
         for frame_file in sorted(frame_files):
             if os.path.exists(frame_file):
                 frame = cv2.imread(frame_file)
                 if frame is not None:
-                    # 调整帧大小以匹配输出尺寸
+                    # 确保帧的大小与视频写入器匹配
                     if frame.shape[1] != width or frame.shape[0] != height:
-                        frame = cv2.resize(frame, (width, height))
+                        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LINEAR)
+
+                    # 确保帧是8位无符号整数
+                    if frame.dtype != np.uint8:
+                        frame = frame.astype(np.uint8)
+
                     out.write(frame)
+                    frame_count += 1
+
+                    # 每100帧释放一次内存
+                    if frame_count % 100 == 0:
+                        self.log(f"已写入 {frame_count} 帧")
         write_time = time.time() - write_start
         out.release()
+
+        # 确保视频文件创建成功
+        if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
+            self.log(f"错误: 视频文件创建失败: {temp_video_path}")
+            return False
+
+        self.log(f"临时视频创建成功，大小: {os.path.getsize(temp_video_path)} 字节")
 
         # 如果有音频，合并音频和视频
         if audio_path and os.path.exists(audio_path):
             self.log("合并音频和视频...")
             merge_start = time.time()
 
-            # 使用ffmpeg合并
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', temp_video_path,
-                '-i', audio_path,
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-map', '0:v:0',
-                '-map', '1:a:0',
-                '-shortest',
-                output_path
-            ]
-
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-                merge_time = time.time() - merge_start
+                # 使用改进的合并命令
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', temp_video_path,
+                    '-i', audio_path,
+                    '-c:v', 'copy',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',
+                    '-strict', 'experimental',
+                    '-loglevel', 'quiet',
+                    output_path
+                ]
+
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
 
                 # 删除临时文件
                 if os.path.exists(temp_video_path):
                     os.remove(temp_video_path)
 
+                merge_time = time.time() - merge_start
+
                 total_time = time.time() - start_time
                 self.log(
                     f"音频视频合并成功，耗时: {total_time:.2f}秒 (写入: {write_time:.2f}s, 合并: {merge_time:.2f}s)")
+                self.log(f"生成视频: {output_path}，分辨率: {width}x{height}，帧率: {fps}，帧数: {frame_count}")
                 return True
+
             except subprocess.CalledProcessError as e:
                 self.log(f"音频视频合并失败: {e.stderr}")
-                # 如果合并失败，使用临时视频文件作为输出
-                if os.path.exists(temp_video_path):
-                    shutil.move(temp_video_path, output_path)
-                return True
+
+                # 如果合并失败，尝试另一种方法
+                try:
+                    self.log("尝试第二种方法合并音频视频...")
+                    cmd2 = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_path,
+                        '-i', audio_path,
+                        '-c:v', 'libx264',
+                        '-c:a', 'aac',
+                        '-b:a', '192k',
+                        '-strict', 'experimental',
+                        '-loglevel', 'quiet',
+                        output_path
+                    ]
+
+                    subprocess.run(cmd2, check=True, capture_output=True, text=True)
+
+                    if os.path.exists(temp_video_path):
+                        os.remove(temp_video_path)
+
+                    self.log("第二种方法合并成功")
+                    return True
+                except Exception as e2:
+                    self.log(f"第二种方法也失败: {e2}")
+                    # 如果合并失败，使用临时视频文件作为输出
+                    if os.path.exists(temp_video_path):
+                        shutil.move(temp_video_path, output_path)
+                        self.log("使用无音频视频作为输出")
+                    return True
+
         else:
             # 如果没有音频，直接使用临时视频文件
             if os.path.exists(temp_video_path):
                 shutil.move(temp_video_path, output_path)
                 total_time = time.time() - start_time
                 self.log(f"视频生成成功，耗时: {total_time:.2f}秒 (写入: {write_time:.2f}s)")
+                self.log(f"生成视频: {output_path}，分辨率: {width}x{height}，帧率: {fps}，帧数: {frame_count}")
                 return True
+            else:
+                self.log(f"错误: 视频文件未创建: {temp_video_path}")
 
         return False
 
-    def concatenate_videos(self, video_list, output_path):
-        """拼接视频片段"""
-        self.log("开始拼接视频片段...")
-        start_time = time.time()
+    def process_segment_directly(self, segment_path, segment_index):
 
-        # 创建临时文件列表
-        list_file = tempfile.mktemp(suffix=".txt")
+        segment_name = os.path.basename(segment_path)
+        self.log(f"直接处理片段 {segment_index}: {segment_name} (使用moviepy)")
+        segment_start_time = time.time()
 
-        with open(list_file, 'w', encoding='utf-8') as f:
-            for video in video_list:
-                f.write(f"file '{os.path.abspath(video)}'\n")
+        if self.test_mode_var.get():
+            self.log("测试模式：不进行超分辨率处理")
+            return None, None
 
-        # 使用ffmpeg拼接
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'concat',
-            '-safe', '0',
-            '-i', list_file,
-            '-c', 'copy',
-            output_path
-        ]
-
+        # 读取视频
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            video = VideoFileClip(segment_path)
+        except Exception as e:
+            self.log(f"读取视频失败: {e}")
+            return None, None
 
-            elapsed = time.time() - start_time
-            self.log(f"视频拼接完成: {output_path}，耗时: {elapsed:.2f}秒")
-            return True
-        except subprocess.CalledProcessError as e:
-            self.log(f"视频拼接失败: {e.stderr}")
-            raise
-        finally:
-            if os.path.exists(list_file):
-                os.remove(list_file)
+        # 获取视频信息
+        fps = video.fps
+        width, height = video.size
+        total_frames = int(video.duration * fps)
+        has_audio = video.audio is not None
+
+        # 提取音频（如果有）
+        audio_path = None
+        if has_audio:
+            audio_name = segment_name.replace('.mp4', '.aac')
+            audio_path = os.path.join(self.temp_base_dir, "02_audio", audio_name)
+            try:
+                video.audio.write_audiofile(audio_path, verbose=False)
+                self.log("音频提取成功")
+            except Exception as e:
+                self.log(f"音频提取失败: {e}")
+                audio_path = None
+                has_audio = False
+
+        # 计算输出尺寸
+        scale = int(self.scale_var.get())
+        downsample_threshold = int(self.downsample_threshold.get())
+
+        short_side = min(height, width)
+        if downsample_threshold != -1 and short_side > downsample_threshold:
+            rescale_factor = short_side / downsample_threshold
+        else:
+            rescale_factor = 1
+
+        # 输出尺寸
+        output_width = int(width * scale / rescale_factor)
+        output_height = int(height * scale / rescale_factor)
+
+        self.log(f"输入尺寸: {width}x{height}, 输出尺寸: {output_width}x{output_height}")
+        self.log(f"直接处理模式：使用moviepy处理，不进行重复帧检测")
+
+        # 创建输出路径
+        processed_segment_path = os.path.join(self.temp_base_dir, "04_processed_segments", f"processed_{segment_name}")
+
+        # 编码参数
+        encode_params = ['-crf', '26', '-preset', 'medium']
+
+        # 创建视频写入器
+        try:
+            if has_audio and audio_path:
+                writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps,
+                                            ffmpeg_params=encode_params, audiofile=audio_path)
+                self.log("使用带音频的视频写入器")
+            else:
+                writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps,
+                                            ffmpeg_params=encode_params)
+                self.log("使用无音频的视频写入器")
+        except Exception as e:
+            self.log(f"创建视频写入器失败: {e}")
+            video.close()
+            return None, None
+
+        frame_idx = 0
+        frames_processed = 0
+        total_frame_time = 0
+
+        # 处理每一帧
+        for frame_idx, img_lr in enumerate(video.iter_frames(fps=fps, dtype='uint8')):
+            # 检查是否被停止
+            if self.stopped:
+                self.log(f"停止处理：片段 {segment_index} 的第 {frame_idx + 1} 帧")
+                break
+
+            # 直接处理模式不支持暂停，所以不需要检查暂停状态
+
+            # 下采样（如果需要）
+            if rescale_factor != 1:
+                img_lr = cv2.resize(img_lr, (int(width / rescale_factor), int(height / rescale_factor)),
+                                    interpolation=cv2.INTER_LINEAR)
+
+            # 裁剪（如果需要）
+            if self.crop_for_4x_var.get() and scale == 4:
+                h, w, _ = img_lr.shape
+                if h % 4 != 0:
+                    img_lr = img_lr[:4 * (h // 4), :, :]
+                if w % 4 != 0:
+                    img_lr = img_lr[:, :4 * (w // 4), :]
+
+            # 处理帧
+            process_start = time.time()
+            sr_frame = self.process_single_frame(img_lr)
+            frame_process_time = time.time() - process_start
+            total_frame_time += frame_process_time
+
+            # 写入帧
+            writer.write_frame(sr_frame)
+
+            # 更新进度
+            frames_processed += 1
+
+            # 更新详细进度
+            if total_frames > 0:
+                self.update_detailed_progress(frame_idx + 1, total_frames)
+
+            # 更新进度条
+            if total_frames > 0:
+                progress = ((frame_idx + 1) / total_frames) * 100
+                self.update_progress(progress)
+
+            # 每处理10帧更新一次日志
+            if (frame_idx + 1) % 10 == 0:
+                avg_frame_time = total_frame_time / (frame_idx + 1)
+                self.log(f"已处理 {frame_idx + 1}/{total_frames} 帧，平均每帧耗时: {avg_frame_time:.3f}秒")
+
+        # 关闭写入器和视频
+        writer.close()
+        video.close()
+
+        # 记录片段处理统计
+        segment_elapsed = time.time() - segment_start_time
+        avg_frame_time = total_frame_time / max(frames_processed, 1)
+
+        self.log(f"直接处理完成: {segment_name}，总耗时: {segment_elapsed:.2f}秒")
+        self.log(f"  处理帧数: {frames_processed}，平均每帧耗时: {avg_frame_time:.3f}秒")
+
+        return processed_segment_path, audio_path if has_audio else None
 
     def immediate_merge_segment(self, processed_segment_path, segment_index):
         """立即合并当前处理好的片段到整体视频中"""
@@ -2611,146 +2774,6 @@ class APISRVideoProcessor:
         finally:
             if os.path.exists(list_file):
                 os.remove(list_file)
-
-    def process_segment_directly(self, segment_path, segment_index):
-        """直接处理视频片段（不使用逐帧检测）"""
-        segment_name = os.path.basename(segment_path)
-        self.log(f"直接处理片段 {segment_index}: {segment_name}")
-        segment_start_time = time.time()
-
-        if self.test_mode_var.get():
-            self.log("测试模式：不进行超分辨率处理")
-            return None, None
-
-        # 提取音频
-        audio_name = segment_name.replace('.mp4', '.aac')
-        audio_path = os.path.join(self.temp_base_dir, "02_audio", audio_name)
-        has_audio = self.extract_audio(segment_path, audio_path)
-
-        if has_audio:
-            self.log("音频提取成功")
-        else:
-            self.log("视频无音频或音频提取失败")
-
-        # 读取视频
-        cap = cv2.VideoCapture(segment_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        if total_frames == 0:
-            self.log(f"警告: 无法获取片段 {segment_path} 的帧数")
-            cap.release()
-            return None, None
-
-        # 计算输出尺寸
-        scale = int(self.scale_var.get())
-        downsample_threshold = int(self.downsample_threshold.get())
-
-        short_side = min(height, width)
-        if downsample_threshold != -1 and short_side > downsample_threshold:
-            rescale_factor = short_side / downsample_threshold
-        else:
-            rescale_factor = 1
-
-        # 输出尺寸
-        output_width = int(width * scale / rescale_factor)
-        output_height = int(height * scale / rescale_factor)
-
-        self.log(f"输入尺寸: {width}x{height}, 输出尺寸: {output_width}x{output_height}")
-        self.log(f"直接处理模式：不进行重复帧检测，直接处理所有帧")
-
-        # 创建临时视频文件
-        processed_segment_path = os.path.join(self.temp_base_dir, "04_processed_segments", f"processed_{segment_name}")
-
-        # 创建视频写入器
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(processed_segment_path, fourcc, fps, (output_width, output_height))
-
-        frame_idx = 0
-        frames_processed = 0
-        total_frame_time = 0
-
-        while True:
-            # 检查是否被停止
-            if self.stopped:
-                self.log(f"停止处理：片段 {segment_index} 的第 {frame_idx + 1} 帧")
-                break
-
-            # 读取帧
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # 处理帧
-            process_start = time.time()
-            sr_frame = self.process_single_frame(frame)
-            frame_process_time = time.time() - process_start
-            total_frame_time += frame_process_time
-
-            # 将处理后的帧写入视频
-            sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
-            out.write(sr_frame_bgr)
-
-            # 更新进度
-            frame_idx += 1
-            frames_processed += 1
-
-            # 更新详细进度
-            self.update_detailed_progress(frame_idx, total_frames)
-
-            # 更新进度条
-            progress = (frame_idx / total_frames) * 100
-            self.update_progress(progress)
-
-            # 每处理10帧更新一次日志
-            if frame_idx % 10 == 0:
-                avg_frame_time = total_frame_time / frame_idx
-                self.log(f"已处理 {frame_idx}/{total_frames} 帧，平均每帧耗时: {avg_frame_time:.3f}秒")
-
-        cap.release()
-        out.release()
-
-        # 如果有音频，合并音频和视频
-        if has_audio and os.path.exists(audio_path):
-            self.log("合并音频和视频...")
-
-            # 创建带音频的最终视频
-            final_segment_path = processed_segment_path.replace('.mp4', '_with_audio.mp4')
-
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', processed_segment_path,
-                '-i', audio_path,
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-map', '0:v:0',
-                '-map', '1:a:0',
-                '-shortest',
-                final_segment_path
-            ]
-
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-                # 删除无音频的视频文件
-                if os.path.exists(processed_segment_path):
-                    os.remove(processed_segment_path)
-                # 重命名为原始名称
-                os.rename(final_segment_path, processed_segment_path)
-                self.log("音频视频合并成功")
-            except subprocess.CalledProcessError as e:
-                self.log(f"音频视频合并失败: {e.stderr}")
-                # 如果合并失败，使用无音频的视频文件
-
-        # 记录片段处理统计
-        segment_elapsed = time.time() - segment_start_time
-        avg_frame_time = total_frame_time / max(frames_processed, 1)
-
-        self.log(f"直接处理完成: {segment_name}，总耗时: {segment_elapsed:.2f}秒")
-        self.log(f"  处理帧数: {frames_processed}，平均每帧耗时: {avg_frame_time:.3f}秒")
-
-        return processed_segment_path, audio_path if has_audio else None
 
     def process_single_video(self, video_path):
         """处理单个视频"""
@@ -2936,7 +2959,7 @@ class APISRVideoProcessor:
                 segment_start = time.time()
 
                 if self.direct_mode and not self.test_mode_var.get():
-                    # 直接处理模式
+                    # 直接处理模式（使用moviepy）
                     processed_segment_path, audio_path = self.process_segment_directly(segment, i + 1)
                 else:
                     # 逐帧处理模式（带重复帧检测）
@@ -3154,6 +3177,41 @@ class APISRVideoProcessor:
                 self.save_progress(force=True)
             return False
 
+    def concatenate_videos(self, video_list, output_path):
+        """拼接视频片段"""
+        self.log("开始拼接视频片段...")
+        start_time = time.time()
+
+        # 创建临时文件列表
+        list_file = tempfile.mktemp(suffix=".txt")
+
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for video in video_list:
+                f.write(f"file '{os.path.abspath(video)}'\n")
+
+        # 使用ffmpeg拼接
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-c', 'copy',
+            output_path
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+            elapsed = time.time() - start_time
+            self.log(f"视频拼接完成: {output_path}，耗时: {elapsed:.2f}秒")
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log(f"视频拼接失败: {e.stderr}")
+            raise
+        finally:
+            if os.path.exists(list_file):
+                os.remove(list_file)
+
     def process_videos(self):
         """主处理函数 - 处理多个视频"""
         try:
@@ -3203,6 +3261,7 @@ class APISRVideoProcessor:
             # 根据处理模式设置暂停按钮状态
             if self.direct_mode:
                 self.pause_btn.config(state='disabled')  # 直接处理模式禁用暂停
+                self.log("直接处理模式：暂停功能已禁用")
             else:
                 self.pause_btn.config(state='normal')  # 逐帧处理模式启用暂停
 

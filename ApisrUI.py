@@ -1,7 +1,6 @@
 import collections
 import json
 import os
-import pickle
 import shutil
 import subprocess
 import sys
@@ -40,6 +39,7 @@ except ImportError as e:
 
 from moviepy import VideoFileClip
 from moviepy.video.io.ffmpeg_writer import FFMPEG_VideoWriter
+
 
 class ModernButton(ttk.Button):
     """现代化按钮样式"""
@@ -93,7 +93,6 @@ class APISRVideoProcessor:
         self.history_size_var = tk.StringVar(value="20")
         self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
         self.last_test_mode_state = False  # 记录上一次的测试模式状态
-        self.direct_mode = False  # 新增：直接处理视频模式标志
 
         # 设置样式
         self.setup_styles()
@@ -123,7 +122,6 @@ class APISRVideoProcessor:
         self.total_segments = 0
         self.segments = []
         self.processed_segments = []
-        self.progress_data_file = None
 
         # 重复帧检测相关
         self.dup_frame_count = 0
@@ -142,8 +140,6 @@ class APISRVideoProcessor:
         self.pause_event = threading.Event()
         self.stop_event = threading.Event()
         self.processing_lock = threading.Lock()
-        self.last_save_time = 0
-        self.save_interval = 10
 
         # 新增：暂停时的内存优化
         self.pause_lock = threading.Lock()
@@ -166,484 +162,6 @@ class APISRVideoProcessor:
 
         # 跟踪测试模式变化
         self.test_mode_var.trace('w', self.on_test_mode_changed)
-
-        # 跟踪重复帧检测变化
-        self.enable_dup_detect_var.trace('w', self.on_dup_detect_changed)
-
-    def on_dup_detect_changed(self, *args):
-        """重复帧检测设置变化时的处理"""
-        current_state = self.enable_dup_detect_var.get()
-
-        # 如果从启用状态切换到禁用状态
-        if not current_state:
-            # 检查是否正在处理中
-            if self.processing and not self.paused:
-                messagebox.showwarning("操作无效", "请先暂停处理后再切换模式！")
-                # 恢复原来的状态
-                self.enable_dup_detect_var.set(True)
-                return
-
-            # 弹出确认对话框
-            response = messagebox.askyesno("切换处理模式",
-                                           "关闭重复帧检测将切换到直接处理视频模式。\n\n"
-                                           "直接处理模式特点：\n"
-                                           "1. 直接处理整个视频片段，不进行逐帧检测\n"
-                                           "2. 处理速度更快，内存占用更低\n"
-                                           "3. 不支持暂停功能（暂停按钮将不可用）\n"
-                                           "4. 当前未完成的逐帧处理任务将被清空\n\n"
-                                           "是否确认切换到直接处理视频模式？")
-
-            if not response:
-                # 用户取消，恢复原来的状态
-                self.enable_dup_detect_var.set(True)
-                return
-            else:
-                # 确认切换到直接处理模式
-                self.direct_mode = True
-                self.log("已切换到直接处理视频模式")
-
-                # 清理当前未完成的逐帧处理任务
-                self.cleanup_current_frame_tasks()
-
-                # 重置当前片段的进度，以便重新处理
-                self.reset_current_segment_progress()
-
-                # 更新UI状态
-                self.update_ui_for_direct_mode()
-
-                # 保存配置
-                self.save_config()
-
-        # 如果从禁用状态切换到启用状态
-        else:
-            if self.direct_mode:
-                # 从直接模式切换回逐帧模式
-                self.direct_mode = False
-                self.log("已切换回逐帧处理模式（带重复帧检测）")
-
-                # 重置当前片段的进度，以便重新处理
-                self.reset_current_segment_progress()
-
-                # 更新UI状态
-                self.update_ui_for_frame_mode()
-
-                # 保存配置
-                self.save_config()
-
-    def cleanup_current_frame_tasks(self):
-        """清理当前未完成的逐帧处理任务"""
-        if self.temp_base_dir and os.path.exists(self.temp_base_dir):
-            # 清理当前片段的帧目录
-            if self.current_segment_index > 0:
-                self.cleanup_segment_frame_dirs(self.current_segment_index)
-
-            # 删除进度文件
-            progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
-            if os.path.exists(progress_file):
-                try:
-                    os.remove(progress_file)
-                    self.log("已清理逐帧处理进度文件")
-                except Exception as e:
-                    self.log(f"清理进度文件时出错: {e}")
-
-            # 重置进度状态
-            self.current_segment_index = 0
-            self.current_frame_in_segment = 0
-            self.total_segments = 0
-            self.segments = []
-            self.processed_segments = []
-            self.dup_frame_count = 0
-            self.update_dup_info(0)
-
-            self.log("已清空当前未完成的逐帧处理任务")
-
-    def reset_current_segment_progress(self):
-        """重置当前片段的进度，以便重新处理"""
-        if self.processing:
-            self.log("重置当前片段进度，以便重新处理...")
-
-            # 清理当前片段的临时文件
-            if self.temp_base_dir and os.path.exists(self.temp_base_dir):
-                # 清理当前片段的帧目录（如果是逐帧模式）
-                if not self.direct_mode and self.current_segment_index > 0:
-                    self.cleanup_segment_frame_dirs(self.current_segment_index)
-
-                # 清理当前片段的已处理视频文件
-                processed_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
-                if os.path.exists(processed_dir):
-                    segment_name = f"segment_{self.current_segment_index:03d}"
-                    for file in os.listdir(processed_dir):
-                        if segment_name in file:
-                            file_path = os.path.join(processed_dir, file)
-                            try:
-                                os.remove(file_path)
-                                self.log(f"已删除已处理的片段文件: {file}")
-                            except Exception as e:
-                                self.log(f"删除文件失败: {file}, 错误: {e}")
-
-                # 从已处理列表中移除当前片段
-                if self.current_segment_index > 0 and self.segments:
-                    segment_path = self.segments[self.current_segment_index - 1]
-                    segment_name = os.path.basename(segment_path)
-                    if segment_name in self.processed_segments:
-                        self.processed_segments.remove(segment_name)
-                        self.log(f"已从已处理列表中移除: {segment_name}")
-
-            # 重置当前片段的帧计数器
-            self.current_frame_in_segment = 0
-
-            # 重新读取进度文件（如果有）
-            self.read_progress_file()
-
-    def read_progress_file(self):
-        """读取进度文件，获取当前处理状态"""
-        if not self.temp_base_dir or not os.path.exists(self.temp_base_dir):
-            return
-
-        progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
-        if os.path.exists(progress_file):
-            try:
-                with open(progress_file, 'rb') as f:
-                    progress_data = pickle.load(f)
-
-                # 更新进度信息
-                self.current_video_index = progress_data.get('current_video_index', 0)
-                self.current_segment_index = progress_data.get('current_segment_index', 0)
-                self.current_frame_in_segment = progress_data.get('current_frame_in_segment', 0)
-                self.total_segments = progress_data.get('total_segments', 0)
-                self.segments = progress_data.get('segments', [])
-                self.processed_segments = progress_data.get('processed_segments', [])
-
-                self.log(f"已读取进度: 视频 {self.current_video_index + 1} - 片段 {self.current_segment_index + 1}")
-
-            except Exception as e:
-                self.log(f"读取进度文件时出错: {e}")
-
-    def detect_actual_progress(self):
-        """检测实际的进度（基于临时文件夹中的文件名）"""
-        if not self.temp_base_dir or not os.path.exists(self.temp_base_dir):
-            return None
-
-        self.log("开始检测实际进度（基于文件名）...")
-
-        detected_segments = []
-        detected_processed_segments = []
-        detected_current_segment_index = 0
-        detected_current_frame_in_segment = 0
-        detected_total_segments = 0
-
-        # 1. 获取片段总数（从01_original_segments目录）
-        segments_dir = os.path.join(self.temp_base_dir, "01_original_segments")
-        if os.path.exists(segments_dir):
-            segment_files = []
-            for f in os.listdir(segments_dir):
-                if f.startswith("segment_") and f.endswith(".mp4"):
-                    segment_files.append(os.path.join(segments_dir, f))
-
-            # 按文件名排序
-            segment_files.sort()
-            detected_total_segments = len(segment_files)
-
-            # 构建segments列表
-            detected_segments = segment_files
-
-            self.log(f"检测到 {detected_total_segments} 个原始片段")
-
-        # 2. 检测已处理的片段（从04_processed_segments目录，基于文件名）
-        processed_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
-        if os.path.exists(processed_dir):
-            processed_files = []
-            for f in os.listdir(processed_dir):
-                if f.startswith("processed_") and f.endswith(".mp4"):
-                    processed_files.append(f)
-
-            # 按文件名排序
-            processed_files.sort()
-
-            # 从文件名提取原始片段名
-            for processed_file in processed_files:
-                # 提取原始片段名（去掉processed_前缀）
-                original_name = processed_file.replace("processed_", "")
-                detected_processed_segments.append(original_name)
-
-            # 根据文件名找出最后一个已处理的片段索引
-            if processed_files:
-                # 提取最后一个处理文件的片段编号
-                last_processed = processed_files[-1]
-                # 格式如：processed_segment_001.mp4
-                try:
-                    # 提取数字部分
-                    import re
-                    match = re.search(r'segment_(\d+)', last_processed)
-                    if match:
-                        last_index = int(match.group(1)) - 1  # 转换为0-based索引
-                        # 设置下一个要处理的片段索引
-                        detected_current_segment_index = last_index + 1
-                        detected_current_frame_in_segment = 0  # 新片段从第0帧开始
-                        self.log(
-                            f"根据文件名检测到最后一个已处理片段: {last_processed}, 下一个片段索引: {detected_current_segment_index}")
-                except Exception as e:
-                    self.log(f"解析处理文件名时出错: {e}")
-
-            self.log(f"检测到 {len(detected_processed_segments)} 个已处理片段")
-
-        # 3. 检测当前处理进度（从03_segment_frames目录，基于after文件夹和帧文件名）
-        frames_dir = os.path.join(self.temp_base_dir, "03_segment_frames")
-        if os.path.exists(frames_dir):
-            # 查找所有after文件夹
-            after_dirs = []
-            for item in os.listdir(frames_dir):
-                item_path = os.path.join(frames_dir, item)
-                if os.path.isdir(item_path) and item.endswith("_after"):
-                    after_dirs.append((item_path, item))
-
-            if after_dirs:
-                # 按文件夹名中的片段索引排序
-                after_dirs.sort(key=lambda x: self.extract_segment_index_from_dirname(x[1]))
-
-                # 处理每个after文件夹
-                for after_dir, dir_name in after_dirs:
-                    try:
-                        # 从文件夹名提取片段索引
-                        segment_idx = self.extract_segment_index_from_dirname(dir_name)
-
-                        # 检查该片段是否在已处理片段列表中
-                        segment_name = f"segment_{segment_idx:03d}.mp4"
-                        if segment_name in detected_processed_segments:
-                            # 如果片段已处理，跳过
-                            continue
-
-                        # 检查文件夹中是否有帧文件
-                        if os.path.exists(after_dir):
-                            frame_files = [f for f in os.listdir(after_dir)
-                                           if f.startswith("frame_") and f.endswith(".png")]
-
-                            if frame_files:
-                                # 按文件名排序
-                                frame_files.sort()
-
-                                # 从最后一个文件名提取最大帧号
-                                last_frame_file = frame_files[-1]
-                                try:
-                                    # 提取帧号（格式：frame_000001.png）
-                                    frame_num = int(last_frame_file.split('_')[1].split('.')[0])
-                                    detected_current_segment_index = segment_idx - 1  # 转换为0-based
-                                    detected_current_frame_in_segment = frame_num + 1  # 下一帧的索引
-                                    self.log(f"根据帧文件名检测到片段 {segment_idx} 已处理 {frame_num + 1} 帧")
-
-                                    # 如果有多个after文件夹，只保留最新的（最大的片段索引）
-                                    break  # 只处理最新的after文件夹
-                                except Exception as e:
-                                    self.log(f"解析帧文件名时出错: {e}")
-                    except Exception as e:
-                        self.log(f"处理after文件夹时出错: {e}")
-
-        # 4. 如果没有检测到after文件夹，但已处理片段存在，设置下一个要处理的片段
-        if detected_current_segment_index == 0 and detected_processed_segments:
-            # 找出最大的已处理片段索引
-            max_processed_index = 0
-            for processed_name in detected_processed_segments:
-                try:
-                    # 格式如：segment_001.mp4
-                    import re
-                    match = re.search(r'segment_(\d+)', processed_name)
-                    if match:
-                        index = int(match.group(1))
-                        if index > max_processed_index:
-                            max_processed_index = index
-                except:
-                    pass
-
-            if max_processed_index > 0:
-                # 设置下一个要处理的片段
-                detected_current_segment_index = max_processed_index  # 已经是1-based
-                detected_current_frame_in_segment = 0
-                self.log(f"根据已处理片段文件名，设置下一个要处理的片段为: {detected_current_segment_index}")
-
-        # 构建检测结果
-        detected_progress = {
-            'current_segment_index': detected_current_segment_index,
-            'current_frame_in_segment': detected_current_frame_in_segment,
-            'total_segments': detected_total_segments,
-            'segments': detected_segments,
-            'processed_segments': detected_processed_segments,
-            'detected_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-        self.log(f"进度检测完成: 片段 {detected_current_segment_index}, 帧 {detected_current_frame_in_segment}")
-        return detected_progress
-
-    def extract_segment_index_from_dirname(self, dir_name):
-        """从文件夹名中提取片段索引"""
-        try:
-            # 格式如：segment_001_after 或 segment_1_after
-            import re
-            match = re.search(r'segment_(\d+)', dir_name)
-            if match:
-                return int(match.group(1))
-            return 0
-        except:
-            return 0
-
-    def compare_progress(self, saved_progress, detected_progress):
-        """比较保存的进度和检测到的进度"""
-        differences = []
-
-        # 检查总片段数
-        if saved_progress.get('total_segments', 0) != detected_progress.get('total_segments', 0):
-            differences.append(
-                f"总片段数: 保存的={saved_progress.get('total_segments', 0)}, 检测的={detected_progress.get('total_segments', 0)}")
-
-        # 检查当前片段索引
-        if saved_progress.get('current_segment_index', 0) != detected_progress.get('current_segment_index', 0):
-            differences.append(
-                f"当前片段: 保存的={saved_progress.get('current_segment_index', 0)}, 检测的={detected_progress.get('current_segment_index', 0)}")
-
-        # 检查当前帧索引
-        if saved_progress.get('current_frame_in_segment', 0) != detected_progress.get('current_frame_in_segment', 0):
-            differences.append(
-                f"当前帧: 保存的={saved_progress.get('current_frame_in_segment', 0)}, 检测的={detected_progress.get('current_frame_in_segment', 0)}")
-
-        # 检查已处理片段数
-        saved_processed = len(saved_progress.get('processed_segments', []))
-        detected_processed = len(detected_progress.get('processed_segments', []))
-        if saved_processed != detected_processed:
-            differences.append(f"已处理片段数: 保存的={saved_processed}, 检测的={detected_processed}")
-
-        # 检查具体的已处理片段
-        saved_set = set(saved_progress.get('processed_segments', []))
-        detected_set = set(detected_progress.get('processed_segments', []))
-        if saved_set != detected_set:
-            differences.append("已处理片段列表不一致")
-
-        return differences
-
-    def update_ui_for_direct_mode(self):
-        """更新UI为直接处理模式"""
-        # 禁用重复帧检测相关设置
-        self.use_ssim_var.set(False)
-        self.use_hash_var.set(False)
-        self.enable_history_var.set(False)
-
-        # 禁用暂停按钮
-        self.pause_btn.config(state='disabled')
-
-        # 更新状态
-        self.status_label.config(text="已切换到直接处理模式", foreground=self.accent_color)
-
-        # 更新日志
-        self.log("直接处理模式已启用")
-        self.log("注意：直接处理模式不支持暂停功能")
-
-    def update_ui_for_frame_mode(self):
-        """更新UI为逐帧处理模式"""
-        # 启用重复帧检测相关设置
-        self.use_ssim_var.set(True)
-        self.use_hash_var.set(True)
-        self.enable_history_var.set(True)
-
-        # 根据处理状态更新暂停按钮
-        if self.processing:
-            self.pause_btn.config(state='normal')
-        else:
-            self.pause_btn.config(state='disabled')
-
-        # 更新状态
-        self.status_label.config(text="已切换回逐帧处理模式", foreground=self.success_color)
-
-        # 更新日志
-        self.log("逐帧处理模式（带重复帧检测）已启用")
-        self.log("注意：逐帧处理模式支持暂停和进度恢复")
-
-    def load_config(self):
-        """加载配置文件"""
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-
-                # 设置变量
-                if 'model' in config:
-                    self.model_var.set(config['model'])
-                if 'scale' in config:
-                    self.scale_var.set(str(config['scale']))
-                if 'segment_duration' in config:
-                    self.segment_duration.set(str(config['segment_duration']))
-                if 'downsample_threshold' in config:
-                    self.downsample_threshold.set(str(config['downsample_threshold']))
-                if 'float16' in config:
-                    self.float16_var.set(config['float16'])
-                if 'crop_for_4x' in config:
-                    self.crop_for_4x_var.set(config['crop_for_4x'])
-                if 'batch_size' in config:
-                    self.batch_size_var.set(str(config['batch_size']))
-                if 'tile_size' in config:
-                    self.tile_size_var.set(str(config['tile_size']))
-                if 'hash_threshold' in config:
-                    self.hash_threshold_var.set(str(config['hash_threshold']))
-                if 'ssim_threshold' in config:
-                    self.ssim_threshold_var.set(str(config['ssim_threshold']))
-                if 'enable_dup_detect' in config:
-                    self.enable_dup_detect_var.set(config['enable_dup_detect'])
-                if 'use_ssim' in config:
-                    self.use_ssim_var.set(config['use_ssim'])
-                if 'use_hash' in config:
-                    self.use_hash_var.set(config['use_hash'])
-                if 'test_mode' in config:
-                    self.test_mode_var.set(config['test_mode'])
-                    self.last_test_mode_state = config['test_mode']  # 记录初始状态
-                if 'enable_history' in config:
-                    self.enable_history_var.set(config['enable_history'])
-                if 'history_size' in config:
-                    self.history_size_var.set(str(config['history_size']))
-                if 'immediate_merge' in config:
-                    self.immediate_merge_var.set(config['immediate_merge'])
-
-                self.log(f"已从 {self.config_file} 加载配置")
-
-                # 更新UI状态
-                self.on_model_change()
-                self.toggle_history_settings()
-
-                # 根据重复帧检测状态设置处理模式
-                if not self.enable_dup_detect_var.get():
-                    self.direct_mode = True
-                    self.update_ui_for_direct_mode()
-            except Exception as e:
-                self.log(f"加载配置文件时出错: {e}")
-        else:
-            self.log("未找到配置文件，使用默认配置")
-
-    def save_config(self):
-        """保存配置文件"""
-        try:
-            config = {
-                'model': self.model_var.get(),
-                'scale': int(self.scale_var.get()),
-                'segment_duration': int(self.segment_duration.get()),
-                'downsample_threshold': int(self.downsample_threshold.get()),
-                'float16': self.float16_var.get(),
-                'crop_for_4x': self.crop_for_4x_var.get(),
-                'batch_size': int(self.batch_size_var.get()),
-                'tile_size': int(self.tile_size_var.get()),
-                'hash_threshold': int(self.hash_threshold_var.get()),
-                'ssim_threshold': float(self.ssim_threshold_var.get()),
-                'enable_dup_detect': self.enable_dup_detect_var.get(),
-                'use_ssim': self.use_ssim_var.get(),
-                'use_hash': self.use_hash_var.get(),
-                'test_mode': self.test_mode_var.get(),
-                'enable_history': self.enable_history_var.get(),
-                'history_size': int(self.history_size_var.get()),
-                'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
-                'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-
-            self.log(f"配置已保存到 {self.config_file}")
-        except Exception as e:
-            self.log(f"保存配置文件时出错: {e}")
 
     def on_test_mode_changed(self, *args):
         """测试模式变化时的处理"""
@@ -680,6 +198,9 @@ class APISRVideoProcessor:
 
         # 更新状态记录
         self.last_test_mode_state = current_state
+
+        # 自动保存配置
+        self.save_config()
 
     def cleanup_test_mode_files(self):
         """清理测试模式产生的临时文件"""
@@ -765,6 +286,7 @@ class APISRVideoProcessor:
                 history_size = 20  # 默认值
                 self.history_size_var.set("20")
 
+        # 确保deque有最大长度限制
         self.frame_history = collections.deque(maxlen=history_size)
         self.frame_hash_history = collections.deque(maxlen=history_size)
 
@@ -882,10 +404,6 @@ class APISRVideoProcessor:
         ttk.Button(right_btn_frame, text="清空日志",
                    command=self.clear_log, width=12).pack(side=tk.RIGHT, padx=2)
 
-        # 新增：保存配置按钮
-        ttk.Button(right_btn_frame, text="保存配置",
-                   command=self.save_config, width=12).pack(side=tk.RIGHT, padx=2)
-
         # 底部状态栏
         status_bar = ttk.Frame(main_container, height=20)
         status_bar.pack(fill=tk.X, pady=(5, 0))
@@ -904,7 +422,7 @@ class APISRVideoProcessor:
         self.gpu_label.pack(side=tk.RIGHT, padx=10)
 
     def setup_config_save_bindings(self):
-        """设置配置保存的事件绑定"""
+        """设置配置自动保存的事件绑定"""
         # 为所有重要变量添加trace，当值改变时自动保存配置
         variables_to_trace = [
             (self.model_var, 'w'),
@@ -928,14 +446,13 @@ class APISRVideoProcessor:
             self.enable_dup_detect_var,
             self.use_ssim_var,
             self.use_hash_var,
-            self.immediate_merge_var,  # 新增
+            self.immediate_merge_var,
+            self.test_mode_var,
+            self.enable_history_var,
         ]
 
         for var in boolean_vars:
             var.trace('w', lambda *args: self.save_config())
-
-        # 测试模式单独处理，因为有弹窗确认
-        # 注意：测试模式的trace已经在__init__中单独设置
 
     def setup_left_panel(self, parent):
         """设置左侧参数面板"""
@@ -1121,9 +638,6 @@ class APISRVideoProcessor:
         # 新增：立即合成视频选项
         ttk.Checkbutton(options_frame, text="立即合成视频",
                         variable=self.immediate_merge_var).pack(anchor=tk.W, pady=2)
-
-        ttk.Checkbutton(options_frame, text="启用配置自动保存",
-                        command=self.save_config).pack(anchor=tk.W, pady=2)
 
         # 说明信息部分
         info_frame = ttk.LabelFrame(bottom_frame, text="说明", padding=8)
@@ -1380,60 +894,92 @@ class APISRVideoProcessor:
         self.progress_var.set(value)
         self.root.update_idletasks()
 
-    def save_progress(self, force=False):
-        """保存进度 - 优化保存频率"""
-        if not self.output_dir.get() or not self.temp_base_dir:
-            return
+    def load_config(self):
+        """加载配置文件"""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
 
-        # 检查是否需要保存
-        current_time = time.time()
-        if not force and current_time - self.last_save_time < self.save_interval:
-            return
+                # 设置变量
+                if 'model' in config:
+                    self.model_var.set(config['model'])
+                if 'scale' in config:
+                    self.scale_var.set(str(config['scale']))
+                if 'segment_duration' in config:
+                    self.segment_duration.set(str(config['segment_duration']))
+                if 'downsample_threshold' in config:
+                    self.downsample_threshold.set(str(config['downsample_threshold']))
+                if 'float16' in config:
+                    self.float16_var.set(config['float16'])
+                if 'crop_for_4x' in config:
+                    self.crop_for_4x_var.set(config['crop_for_4x'])
+                if 'batch_size' in config:
+                    self.batch_size_var.set(str(config['batch_size']))
+                if 'tile_size' in config:
+                    self.tile_size_var.set(str(config['tile_size']))
+                if 'hash_threshold' in config:
+                    self.hash_threshold_var.set(str(config['hash_threshold']))
+                if 'ssim_threshold' in config:
+                    self.ssim_threshold_var.set(str(config['ssim_threshold']))
+                if 'enable_dup_detect' in config:
+                    self.enable_dup_detect_var.set(config['enable_dup_detect'])
+                if 'use_ssim' in config:
+                    self.use_ssim_var.set(config['use_ssim'])
+                if 'use_hash' in config:
+                    self.use_hash_var.set(config['use_hash'])
+                if 'test_mode' in config:
+                    self.test_mode_var.set(config['test_mode'])
+                    self.last_test_mode_state = config['test_mode']  # 记录初始状态
+                if 'enable_history' in config:
+                    self.enable_history_var.set(config['enable_history'])
+                if 'history_size' in config:
+                    self.history_size_var.set(str(config['history_size']))
+                if 'immediate_merge' in config:
+                    self.immediate_merge_var.set(config['immediate_merge'])
 
-        # 保存当前视频的进度
-        current_video_path = self.input_paths[self.current_video_index] if self.current_video_index < len(
-            self.input_paths) else ""
+                self.log(f"已从 {self.config_file} 加载配置")
 
-        progress_data = {
-            'current_video_index': self.current_video_index,
-            'current_video_path': current_video_path,
-            'model': self.model_var.get(),
-            'scale': int(self.scale_var.get()),
-            'downsample_threshold': int(self.downsample_threshold.get()),
-            'float16': self.float16_var.get(),
-            'crop_for_4x': self.crop_for_4x_var.get(),
-            'batch_size': int(self.batch_size_var.get()),
-            'hash_threshold': int(self.hash_threshold_var.get()),
-            'ssim_threshold': float(self.ssim_threshold_var.get()),
-            'use_hash': self.use_hash_var.get(),
-            'use_ssim': self.use_ssim_var.get(),
-            'test_mode': self.test_mode_var.get(),
-            'enable_history': self.enable_history_var.get(),
-            'history_size': int(self.history_size_var.get()),
-            'immediate_merge': self.immediate_merge_var.get(),  # 新增
-            'current_segment_index': self.current_segment_index,
-            'current_frame_in_segment': self.current_frame_in_segment,
-            'total_segments': self.total_segments,
-            'segments': self.segments,
-            'processed_segments': self.processed_segments,
-            'temp_base_dir': self.temp_base_dir,
-            'is_test_mode_folder': self.is_test_mode_folder,  # 新增
-            'dup_frame_count': self.dup_frame_count,
-            'direct_mode': self.direct_mode,  # 新增：保存直接处理模式状态
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
+                # 更新UI状态
+                self.on_model_change()
+                self.toggle_history_settings()
 
-        progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
+            except Exception as e:
+                self.log(f"加载配置文件时出错: {e}")
+        else:
+            self.log("未找到配置文件，使用默认配置")
+
+    def save_config(self):
+        """保存配置文件（永远自动保存）"""
         try:
-            with open(progress_file, 'wb') as f:
-                pickle.dump(progress_data, f)
+            config = {
+                'model': self.model_var.get(),
+                'scale': int(self.scale_var.get()),
+                'segment_duration': int(self.segment_duration.get()),
+                'downsample_threshold': int(self.downsample_threshold.get()),
+                'float16': self.float16_var.get(),
+                'crop_for_4x': self.crop_for_4x_var.get(),
+                'batch_size': int(self.batch_size_var.get()),
+                'tile_size': int(self.tile_size_var.get()),
+                'hash_threshold': int(self.hash_threshold_var.get()),
+                'ssim_threshold': float(self.ssim_threshold_var.get()),
+                'enable_dup_detect': self.enable_dup_detect_var.get(),
+                'use_ssim': self.use_ssim_var.get(),
+                'use_hash': self.use_hash_var.get(),
+                'test_mode': self.test_mode_var.get(),
+                'enable_history': self.enable_history_var.get(),
+                'history_size': int(self.history_size_var.get()),
+                'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
+                'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
 
-            self.last_save_time = current_time
-            if force:
-                self.log(
-                    f"进度已保存: 视频 {self.current_video_index + 1} - 片段 {self.current_segment_index + 1} 的第 {self.current_frame_in_segment + 1} 帧")
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+
+            # 只在调试时显示保存日志，避免频繁输出
+            # self.log(f"配置已自动保存到 {self.config_file}")
         except Exception as e:
-            self.log(f"保存进度时出错: {e}")
+            self.log(f"保存配置文件时出错: {e}")
 
     # ============================================================
     # 模型加载函数（从test_utils.py整合）
@@ -1651,9 +1197,6 @@ class APISRVideoProcessor:
         frame_hash = imagehash.phash(pil_img, hash_size=8)  # 减小哈希大小以提高计算速度
 
         elapsed = time.time() - start_time
-        if elapsed > 0.01:  # 只记录耗时较长的哈希计算
-            self.log(f"哈希计算耗时: {elapsed:.3f}秒")
-
         return frame_hash
 
     def calculate_ssim_fast(self, frame1, frame2):
@@ -1686,15 +1229,8 @@ class APISRVideoProcessor:
 
         try:
             ssim_value, _ = ssim(gray1, gray2, full=True, data_range=255)
-
-            elapsed = time.time() - start_time
-            if elapsed > 0.01:  # 只记录耗时较长的SSIM计算
-                self.log(f"SSIM计算耗时: {elapsed:.3f}秒，结果: {ssim_value:.4f}")
-
             return ssim_value
         except:
-            elapsed = time.time() - start_time
-            self.log(f"SSIM计算失败，耗时: {elapsed:.3f}秒")
             return 0.0
 
     def check_frame_duplicate_enhanced(self, frame, frame_idx):
@@ -1737,6 +1273,8 @@ class APISRVideoProcessor:
         best_match_reason = ""
         best_hash_diff = None
         best_ssim_value = None
+        detected_hash_diff = None
+        detected_ssim_value = None
 
         # 遍历历史帧（从最近的开始）
         compare_start = time.time()
@@ -1759,12 +1297,18 @@ class APISRVideoProcessor:
                 hash_diff = current_hash - hist_hash
                 hash_compare_time += time.time() - hash_compare_start
 
+                # 记录哈希差值（用于日志输出）
+                detected_hash_diff = hash_diff
+
                 if hash_diff <= hash_threshold:
                     # 如果同时启用了SSIM检测，需要验证SSIM
                     if self.use_ssim_var.get():
                         ssim_compare_start = time.time()
                         ssim_value = self.calculate_ssim_fast(frame, hist_frame)
                         ssim_compare_time += time.time() - ssim_compare_start
+
+                        # 记录SSIM值（用于日志输出）
+                        detected_ssim_value = ssim_value
 
                         if ssim_value >= ssim_threshold:
                             best_match_idx = i
@@ -1784,6 +1328,9 @@ class APISRVideoProcessor:
                 ssim_value = self.calculate_ssim_fast(frame, hist_frame)
                 ssim_compare_time += time.time() - ssim_compare_start
 
+                # 记录SSIM值（用于日志输出）
+                detected_ssim_value = ssim_value
+
                 if ssim_value >= ssim_threshold:
                     best_match_idx = i
                     best_match_reason = f"SSIM匹配({ssim_value:.3f})"
@@ -1791,31 +1338,27 @@ class APISRVideoProcessor:
                     break
 
         compare_time = time.time() - compare_start
+        total_elapsed = time.time() - start_time
+
+        # 构建检测值字符串
+        detection_values = []
+        if self.use_hash_var.get() and detected_hash_diff is not None:
+            detection_values.append(f"哈希差: {detected_hash_diff}")
+        if self.use_ssim_var.get() and detected_ssim_value is not None:
+            detection_values.append(f"SSIM: {detected_ssim_value:.3f}")
+
+        detection_str = "，".join(detection_values)
 
         if best_match_idx >= 0:
             # 找到匹配的帧
             matched_sr_result = self.frame_sr_history[best_match_idx]
             matched_frame_idx = self.frame_idx_history[best_match_idx]
 
-            # 详细计时信息
-            total_elapsed = time.time() - start_time
-            timing_info = []
-            if hash_time > 0:
-                timing_info.append(f"哈希计算: {hash_time:.3f}s")
-            if ssim_thumbnail_time > 0:
-                timing_info.append(f"缩略图: {ssim_thumbnail_time:.3f}s")
-            if hash_compare_time > 0:
-                timing_info.append(f"哈希比较: {hash_compare_time:.3f}s")
-            if ssim_compare_time > 0:
-                timing_info.append(f"SSIM比较: {ssim_compare_time:.3f}s")
-
-            timing_str = f" 计时: {total_elapsed:.3f}s ({', '.join(timing_info)})"
-
-            # 简化日志输出
+            # 构建日志消息
             log_message = f"帧 {frame_idx:04d}: 与帧 {matched_frame_idx:04d} 重复"
-            if self.enable_history_var.get():
-                log_message += f" (历史帧: {history_size})"
-            log_message += timing_str
+            if detection_str:
+                log_message += f" ({detection_str})"
+            log_message += f" - {total_elapsed:.3f}s"
 
             self.log(log_message)
 
@@ -1851,33 +1394,22 @@ class APISRVideoProcessor:
 
             return True, matched_sr_result.copy(), current_hash, current_thumbnail
 
-        # 如果没有找到匹配帧，也输出日志（仅当启用详细日志时）
+        # 如果没有找到匹配帧
         else:
-            total_elapsed = time.time() - start_time
+            # 构建日志消息
+            log_message = f"帧 {frame_idx:04d}: 未重复"
+            if detection_str:
+                log_message += f" ({detection_str})"
+            log_message += f" - {total_elapsed:.3f}s"
+
+            # 只在检测耗时较长时输出日志
             if total_elapsed > 0.05:  # 只记录耗时较长的检测
-                timing_info = []
-                if hash_time > 0:
-                    timing_info.append(f"哈希计算: {hash_time:.3f}s")
-                if ssim_thumbnail_time > 0:
-                    timing_info.append(f"缩略图: {ssim_thumbnail_time:.3f}s")
-                if compare_time > 0:
-                    timing_info.append(f"比较: {compare_time:.3f}s")
-
-                timing_str = f" 计时: {total_elapsed:.3f}s ({', '.join(timing_info)})"
-
-                log_message = f"帧 {frame_idx:04d}: 未重复"
-                if self.enable_history_var.get():
-                    log_message += f" (历史帧: {history_size})"
-                log_message += timing_str
-
                 self.log(log_message)
 
         return False, None, current_hash, current_thumbnail
 
     def add_frame_to_history(self, frame, frame_hash, frame_thumbnail, sr_result, frame_idx):
         """添加帧到历史记录"""
-        start_time = time.time()
-
         # 添加帧数据
         self.frame_history.append(frame.copy())
         self.frame_hash_history.append(frame_hash)
@@ -1886,10 +1418,6 @@ class APISRVideoProcessor:
 
         self.frame_sr_history.append(sr_result.copy() if sr_result is not None else None)
         self.frame_idx_history.append(frame_idx)
-
-        elapsed = time.time() - start_time
-        if elapsed > 0.01:  # 只记录耗时较长的添加操作
-            self.log(f"添加到历史缓存耗时: {elapsed:.3f}秒")
 
     # ============================================================
     # 视频处理函数
@@ -2023,13 +1551,9 @@ class APISRVideoProcessor:
             # 测试模式不处理，直接返回RGB格式
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             elapsed = time.time() - start_time
-            if elapsed > 0.05:
-                self.log(f"测试模式帧处理耗时: {elapsed:.3f}秒")
             return frame_rgb
 
         from torchvision.transforms import ToTensor
-
-        preprocess_start = time.time()
 
         # 预处理
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -2057,26 +1581,19 @@ class APISRVideoProcessor:
             if w % 4 != 0:
                 frame_rgb = frame_rgb[:, :4 * (w // 4), :]
 
-        preprocess_time = time.time() - preprocess_start
-
         # 转换为tensor并进行推理
-        tensor_start = time.time()
         img_tensor = ToTensor()(frame_rgb).unsqueeze(0)
 
         if torch.cuda.is_available():
             img_tensor = img_tensor.cuda()
 
         img_tensor = img_tensor.to(dtype=self.weight_dtype)
-        tensor_time = time.time() - tensor_start
 
         # 推理
-        inference_start = time.time()
         with torch.no_grad():
             result = self.generator(img_tensor)
-        inference_time = time.time() - inference_start
 
         # 后处理
-        postprocess_start = time.time()
         # 转换为numpy数组
         result_np = result[0].cpu().detach().numpy()
         result_np = np.transpose(result_np, (1, 2, 0))
@@ -2088,15 +1605,11 @@ class APISRVideoProcessor:
             output_w = int(original_w * scale)
             result_np = cv2.resize(result_np, (output_w, output_h), interpolation=cv2.INTER_LINEAR)
 
-        postprocess_time = time.time() - postprocess_start
-
         total_elapsed = time.time() - start_time
 
         # 记录耗时信息（只记录耗时较长的帧处理）
         if total_elapsed > 0.2:  # 只记录超过200ms的帧处理
-            self.log(f"帧处理耗时: {total_elapsed:.3f}秒 (预处理: {preprocess_time:.3f}s, "
-                     f"张量化: {tensor_time:.3f}s, 推理: {inference_time:.3f}s, "
-                     f"后处理: {postprocess_time:.3f}s)")
+            self.log(f"帧处理耗时: {total_elapsed:.3f}秒")
 
         return result_np
 
@@ -2106,10 +1619,8 @@ class APISRVideoProcessor:
         is_duplicate = False
 
         # 检查是否为重复帧
-        dup_detect_start = time.time()
         is_duplicate, matched_sr_result, current_hash, current_thumbnail = \
             self.check_frame_duplicate_enhanced(frame, frame_idx)
-        dup_detect_time = time.time() - dup_detect_start
 
         if is_duplicate and matched_sr_result is not None:
             # 找到重复帧，直接使用历史超分辨率结果
@@ -2130,19 +1641,12 @@ class APISRVideoProcessor:
             self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
 
             total_elapsed = time.time() - start_time
-            # 记录重复帧的处理总耗时
-            if total_elapsed > 0.1:
-                self.log(f"重复帧处理总耗时: {total_elapsed:.3f}秒 (检测: {dup_detect_time:.3f}s)")
-
             return result_np, current_hash, current_thumbnail, is_duplicate
 
         # 非重复帧，进行超分辨率处理
-        sr_start = time.time()
         result_np = self.process_single_frame(frame)
-        sr_time = time.time() - sr_start
 
         # 计算当前帧的信息
-        info_start = time.time()
         if current_hash is None and self.use_hash_var.get():
             current_hash = self.calculate_frame_hash(frame)
         if current_thumbnail is None and self.use_ssim_var.get():
@@ -2153,56 +1657,88 @@ class APISRVideoProcessor:
                 current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             else:
                 current_thumbnail = frame.copy()
-        info_time = time.time() - info_start
 
         # 更新历史记录
-        history_start = time.time()
         self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
-        history_time = time.time() - history_start
-
-        total_elapsed = time.time() - start_time
-
-        # 记录非重复帧的处理总耗时（只记录耗时较长的帧）
-        if total_elapsed > 0.3:  # 只记录超过300ms的帧处理
-            self.log(f"新帧处理总耗时: {total_elapsed:.3f}秒 (检测: {dup_detect_time:.3f}s, "
-                     f"超分: {sr_time:.3f}s, 信息计算: {info_time:.3f}s, "
-                     f"历史更新: {history_time:.3f}s)")
 
         return result_np, current_hash, current_thumbnail, is_duplicate
 
-    def apply_new_settings(self):
-        """应用新的设置到当前处理中"""
-        self.log("正在应用新的设置...")
+    def detect_progress_from_folders(self):
+        """从文件夹内容检测进度"""
+        if not self.temp_base_dir or not os.path.exists(self.temp_base_dir):
+            return 0, 0, []
 
-        # 重新初始化历史帧缓存
-        self.init_history_cache()
+        self.log("开始从文件夹检测进度...")
 
-        # 记录当前设置
-        if self.enable_dup_detect_var.get():
-            methods = []
-            if self.use_hash_var.get():
-                methods.append(f"哈希(阈值:{self.hash_threshold_var.get()})")
-            if self.use_ssim_var.get():
-                methods.append(f"SSIM(阈值:{self.ssim_threshold_var.get()})")
+        # 1. 从04_processed_segments文件夹获取已处理的片段
+        processed_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
+        processed_segments = []
+        if os.path.exists(processed_dir):
+            for f in os.listdir(processed_dir):
+                if f.startswith("processed_segment_") and f.endswith(".mp4"):
+                    # 提取片段编号，如processed_segment_001.mp4 -> 1
+                    try:
+                        segment_num = int(f.split('_')[2].split('.')[0])
+                        processed_segments.append(segment_num)
+                    except:
+                        pass
 
-            if self.enable_history_var.get():
-                history_size = int(self.history_size_var.get())
-                self.log(f"重复帧检测: {', '.join(methods)}，历史帧: {history_size}")
-            else:
-                self.log(f"重复帧检测: {', '.join(methods)}，仅与前帧比较")
+        # 2. 从03_segment_frames文件夹获取当前处理的片段和帧
+        frames_dir = os.path.join(self.temp_base_dir, "03_segment_frames")
+        current_segment = 0
+        current_frame = 0
+
+        if os.path.exists(frames_dir):
+            # 查找所有after文件夹
+            after_dirs = []
+            for item in os.listdir(frames_dir):
+                item_path = os.path.join(frames_dir, item)
+                if os.path.isdir(item_path) and item.endswith("_after"):
+                    after_dirs.append(item_path)
+
+            if after_dirs:
+                # 按文件夹名排序（最新的在前）
+                after_dirs.sort(key=lambda x: os.path.basename(x))
+
+                # 处理最新的after文件夹
+                latest_after_dir = after_dirs[-1]
+                dir_name = os.path.basename(latest_after_dir)
+
+                # 提取片段编号，如segment_001_after -> 1
+                try:
+                    current_segment = int(dir_name.split('_')[1])
+                except:
+                    current_segment = 0
+
+                # 计算已处理的帧数
+                if os.path.exists(latest_after_dir):
+                    frame_files = [f for f in os.listdir(latest_after_dir)
+                                   if f.startswith("frame_") and f.endswith(".png")]
+                    if frame_files:
+                        # 按文件名排序，获取最大的帧号
+                        frame_files.sort()
+                        last_frame = frame_files[-1]
+                        try:
+                            current_frame = int(last_frame.split('_')[1].split('.')[0]) + 1
+                        except:
+                            current_frame = 0
+
+        # 3. 确定下一个要处理的片段
+        if processed_segments:
+            last_processed = max(processed_segments)
+            next_segment = last_processed + 1
         else:
-            self.log("重复帧检测已禁用")
+            next_segment = 1
 
-        # 记录立即合成设置
-        if self.immediate_merge_var.get():
-            self.log("立即合成视频功能已启用")
-        else:
-            self.log("立即合成视频功能已禁用")
+        # 如果当前片段已经有帧在处理，使用当前片段
+        if current_frame > 0:
+            next_segment = current_segment
 
-        return True
+        self.log(f"进度检测结果: 下一个片段={next_segment}, 当前帧={current_frame}")
+        return next_segment, current_frame, processed_segments
 
     def process_segment_frames(self, segment_path, segment_index):
-        """处理视频片段的所有帧（逐帧处理）"""
+        """处理视频片段的所有帧（逐帧处理）- 修改：停止后保留临时文件"""
         segment_name = os.path.basename(segment_path)
         self.log(f"处理片段 {segment_index}: {segment_name}")
         segment_start_time = time.time()
@@ -2275,7 +1811,7 @@ class APISRVideoProcessor:
             else:
                 self.log(f"重复帧检测: {', '.join(methods)}，仅与前帧比较")
 
-        # 如果从进度恢复，跳过已处理的帧
+        # 从进度检测中获取起始帧
         start_frame = self.current_frame_in_segment
         if start_frame > 0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
@@ -2305,48 +1841,63 @@ class APISRVideoProcessor:
 
         # 统计计时
         total_frame_time = 0
-        total_save_time = 0
-        total_dup_detect_time = 0
 
-        while True:
+        # 检查片段是否已经完全处理完
+        segment_completed = False
+        if os.path.exists(after_dir):
+            after_files = [f for f in os.listdir(after_dir) if f.startswith("frame_") and f.endswith(".png")]
+            if len(after_files) >= total_frames:
+                self.log(f"片段 {segment_index} 已经完成处理，跳过")
+                segment_completed = True
+
+        while not segment_completed:
             # 检查是否被停止
             if self.stopped:
                 self.log(f"停止处理：片段 {segment_index} 的第 {frame_idx + 1} 帧")
+                self.log(f"已处理的帧已保存在: {after_dir}")
                 break
 
             # 检查是否暂停 - 使用高效等待
             if self.paused:
                 self.log(f"处理暂停于片段 {segment_index} 的第 {frame_idx + 1} 帧")
-                self.save_progress(force=True)  # 暂停时立即保存进度
 
-                # 释放GPU内存以降低占用
-                if not self.test_mode_var.get():
-                    torch.cuda.empty_cache()
+                # 释放GPU内存以降低占用 - 修改：将模型从GPU移出
+                if not self.test_mode_var.get() and self.generator is not None:
+                    try:
+                        # 将模型移动到CPU并释放GPU内存
+                        self.generator = self.generator.cpu()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()  # 等待CUDA操作完成
+                        self.log("模型已移动到CPU，GPU内存已释放")
+                    except Exception as e:
+                        self.log(f"移动模型到CPU时出错: {e}")
 
                 # 高效等待，而不是忙等待
+                self.pause_btn.config(text="▶ 继续")
+                self.update_status("已暂停", "orange")
+
                 while self.paused and not self.stopped:
-                    time.sleep(1.0)  # 使用较长的休眠时间减少CPU占用
-                    if self.paused:  # 再次检查，避免错过状态变化
-                        # 在等待期间定期释放GPU内存
-                        if frame_idx % 10 == 0 and not self.test_mode_var.get():
-                            torch.cuda.empty_cache()
+                    time.sleep(0.5)  # 使用较短的休眠时间以便快速响应
+                    if self.paused:
+                        # 定期检查是否需要恢复
+                        pass
+
+                # 恢复处理
+                if not self.stopped:
+                    if not self.test_mode_var.get() and self.generator is not None:
+                        try:
+                            # 将模型移回GPU
+                            self.generator = self.generator.cuda()
+                            self.log("模型已移回GPU")
+                        except Exception as e:
+                            self.log(f"移动模型回GPU时出错: {e}")
+
+                    self.pause_btn.config(text="⏸ 暂停")
+                    self.update_status("处理中...", "blue")
+                    self.log(f"处理继续于片段 {segment_index} 的第 {frame_idx + 1} 帧")
 
                 if self.stopped:
                     break
-
-                # 恢复时应用最新的设置
-                self.log("暂停后继续，正在检查并应用新设置...")
-                self.apply_new_settings()
-
-                # 恢复时重新加载模型（如果需要）
-                if not self.test_mode_var.get() and self.generator is None:
-                    try:
-                        self.generator = self.load_model()
-                    except Exception as e:
-                        self.log(f"恢复时重新加载模型失败: {e}")
-                        break
-
-                self.log(f"处理继续于片段 {segment_index} 的第 {frame_idx + 1} 帧")
 
             # 读取帧
             ret, frame = cap.read()
@@ -2354,11 +1905,8 @@ class APISRVideoProcessor:
                 break
 
             # 保存原始帧到before目录
-            save_start = time.time()
             before_path = os.path.join(before_dir, f"frame_{frame_idx:06d}.png")
             cv2.imwrite(before_path, frame)
-            save_time = time.time() - save_start
-            total_save_time += save_time
 
             # 使用增强的重复帧检测处理帧
             process_start = time.time()
@@ -2368,15 +1916,12 @@ class APISRVideoProcessor:
             total_frame_time += frame_process_time
 
             if is_duplicate:
-                total_dup_detect_time += frame_process_time
+                segment_dup_count += 1
 
             # 保存处理后的帧到after目录
-            after_save_start = time.time()
             after_path = os.path.join(after_dir, f"frame_{frame_idx:06d}.png")
             sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
             cv2.imwrite(after_path, sr_frame_bgr)
-            after_save_time = time.time() - after_save_start
-            total_save_time += after_save_time
 
             # 添加到帧文件列表
             if not self.test_mode_var.get():
@@ -2387,7 +1932,6 @@ class APISRVideoProcessor:
                 if is_duplicate:
                     matched_idx = self.frame_idx_history[0] if self.frame_idx_history else "未知"
                     dup_file.write(f"{frame_idx}\t是\t{matched_idx}\t重复帧，使用历史结果\n")
-                    segment_dup_count += 1
                 else:
                     dup_file.write(f"{frame_idx}\t否\t-\t正常处理\n")
 
@@ -2398,13 +1942,10 @@ class APISRVideoProcessor:
             # 更新详细进度
             self.update_detailed_progress(self.current_frame_in_segment, total_frames)
 
-            # 每处理10帧保存一次进度
+            # 每处理10帧更新一次进度
             if frames_processed % 10 == 0:
-                self.save_progress(force=True)
-
-            # 更新进度条
-            progress = (self.current_frame_in_segment / total_frames) * 100
-            self.update_progress(progress)
+                progress = (self.current_frame_in_segment / total_frames) * 100
+                self.update_progress(progress)
 
             frame_idx += 1
 
@@ -2417,17 +1958,12 @@ class APISRVideoProcessor:
         # 记录片段处理统计
         segment_elapsed = time.time() - segment_start_time
         avg_frame_time = total_frame_time / max(frames_processed, 1)
-        avg_save_time = total_save_time / max(frames_processed, 1)
 
         self.log(f"片段处理完成: {segment_name}，总耗时: {segment_elapsed:.2f}秒")
         self.log(f"  处理帧数: {frames_processed}，平均每帧耗时: {avg_frame_time:.3f}秒")
-        self.log(f"  文件保存平均耗时: {avg_save_time:.3f}秒")
 
         if self.enable_dup_detect_var.get():
-            self.log(f"  检测到重复帧: {segment_dup_count}个，重复检测总耗时: {total_dup_detect_time:.2f}秒")
-            if segment_dup_count > 0:
-                avg_dup_time = total_dup_detect_time / segment_dup_count
-                self.log(f"  平均每个重复帧检测耗时: {avg_dup_time:.3f}秒")
+            self.log(f"  检测到重复帧: {segment_dup_count}个")
 
         # 清空历史缓存以释放内存
         self.frame_history.clear()
@@ -2437,7 +1973,29 @@ class APISRVideoProcessor:
         self.frame_sr_history.clear()
         self.frame_idx_history.clear()
 
-        return frame_files, audio_path
+        # 只有在片段完全处理完且没有停止时才生成视频
+        if not self.stopped and frame_idx >= total_frames and not self.test_mode_var.get() and frame_files:
+            # 生成处理后的片段视频
+            processed_segment_path = os.path.join(self.temp_base_dir, "04_processed_segments",
+                                                  f"processed_{segment_name}")
+
+            # 将帧转换为视频
+            success = self.frames_to_video(frame_files, processed_segment_path, fps, output_width, output_height,
+                                           audio_path)
+            if success:
+                self.log(f"片段视频生成成功: {processed_segment_path}")
+                return processed_segment_path, audio_path
+            else:
+                self.log("片段视频生成失败")
+                return None, None
+        else:
+            if self.stopped:
+                self.log("处理被停止，不生成视频片段，保留临时文件以便下次继续处理")
+            elif self.test_mode_var.get():
+                self.log("测试模式：不生成视频片段")
+            elif not frame_files:
+                self.log("没有帧文件可处理")
+            return None, None
 
     def frames_to_video(self, frame_files, output_path, fps, width, height, audio_path=None):
         """将帧序列转换为视频（修复版）"""
@@ -2574,9 +2132,9 @@ class APISRVideoProcessor:
         return False
 
     def process_segment_directly(self, segment_path, segment_index):
-
+        """直接处理视频片段（不进行重复帧检测）"""
         segment_name = os.path.basename(segment_path)
-        self.log(f"直接处理片段 {segment_index}: {segment_name} (使用moviepy)")
+        self.log(f"直接处理片段 {segment_index}: {segment_name}")
         segment_start_time = time.time()
 
         if self.test_mode_var.get():
@@ -2629,18 +2187,14 @@ class APISRVideoProcessor:
         # 创建输出路径
         processed_segment_path = os.path.join(self.temp_base_dir, "04_processed_segments", f"processed_{segment_name}")
 
-        # 编码参数
-        encode_params = ['-crf', '26', '-preset', 'medium']
-
         # 创建视频写入器
         try:
             if has_audio and audio_path:
                 writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps,
-                                            ffmpeg_params=encode_params, audiofile=audio_path)
+                                            audiofile=audio_path)
                 self.log("使用带音频的视频写入器")
             else:
-                writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps,
-                                            ffmpeg_params=encode_params)
+                writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps)
                 self.log("使用无音频的视频写入器")
         except Exception as e:
             self.log(f"创建视频写入器失败: {e}")
@@ -2660,27 +2214,32 @@ class APISRVideoProcessor:
 
             # 直接处理模式不支持暂停，所以不需要检查暂停状态
 
+            # 注意：moviepy返回的是RGB格式，需要转换为BGR进行超分处理
+            # 转换为BGR格式
+            img_lr_bgr = cv2.cvtColor(img_lr, cv2.COLOR_RGB2BGR)
+
             # 下采样（如果需要）
             if rescale_factor != 1:
-                img_lr = cv2.resize(img_lr, (int(width / rescale_factor), int(height / rescale_factor)),
-                                    interpolation=cv2.INTER_LINEAR)
+                img_lr_bgr = cv2.resize(img_lr_bgr, (int(width / rescale_factor), int(height / rescale_factor)),
+                                        interpolation=cv2.INTER_LINEAR)
 
             # 裁剪（如果需要）
             if self.crop_for_4x_var.get() and scale == 4:
-                h, w, _ = img_lr.shape
+                h, w, _ = img_lr_bgr.shape
                 if h % 4 != 0:
-                    img_lr = img_lr[:4 * (h // 4), :, :]
+                    img_lr_bgr = img_lr_bgr[:4 * (h // 4), :, :]
                 if w % 4 != 0:
-                    img_lr = img_lr[:, :4 * (w // 4), :]
+                    img_lr_bgr = img_lr_bgr[:, :4 * (w // 4), :]
 
             # 处理帧
             process_start = time.time()
-            sr_frame = self.process_single_frame(img_lr)
+            sr_frame = self.process_single_frame(img_lr_bgr)
             frame_process_time = time.time() - process_start
             total_frame_time += frame_process_time
 
-            # 写入帧
-            writer.write_frame(sr_frame)
+            # 写入帧（注意：moviepy需要RGB格式）
+            sr_frame_rgb = cv2.cvtColor(sr_frame, cv2.COLOR_BGR2RGB)
+            writer.write_frame(sr_frame_rgb)
 
             # 更新进度
             frames_processed += 1
@@ -2794,97 +2353,41 @@ class APISRVideoProcessor:
             if self.is_test_mode_folder:
                 self.log("注意：当前为测试模式文件夹")
 
-            # 测试模式不保存进度，所以不进行进度检测
-            if self.test_mode_var.get():
-                self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理，不保存进度")
-                # 重置进度
-                self.current_segment_index = 0
-                self.current_frame_in_segment = 0
-                self.total_segments = 0
-                self.segments = []
-                self.processed_segments = []
-                self.dup_frame_count = 0
-                self.update_dup_info(self.dup_frame_count)
+            # 检测进度
+            if self.enable_dup_detect_var.get():
+                # 启用重复帧检测模式：从03和04文件夹检测进度
+                next_segment, current_frame, processed_segments = self.detect_progress_from_folders()
+                self.current_segment_index = next_segment - 1 if next_segment > 0 else 0
+                self.current_frame_in_segment = current_frame
+                self.processed_segments = [f"segment_{i:03d}.mp4" for i in processed_segments]
+                self.log(f"从文件夹检测到进度: 下一个片段={next_segment}, 当前帧={current_frame}")
             else:
-                # 非测试模式：检查进度文件
-                progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
-
-                if os.path.exists(progress_file):
-                    try:
-                        with open(progress_file, 'rb') as f:
-                            saved_progress = pickle.load(f)
-
-                        # 检测实际进度
-                        detected_progress = self.detect_actual_progress()
-
-                        if detected_progress:
-                            # 比较进度差异
-                            differences = self.compare_progress(saved_progress, detected_progress)
-
-                            if differences:
-                                # 进度不一致，询问用户使用哪个进度
-                                diff_text = "\n".join(differences[:5])  # 只显示前5个差异
-                                if len(differences) > 5:
-                                    diff_text += f"\n...还有{len(differences) - 5}个差异"
-
-                                response = messagebox.askyesno("进度不一致检测",
-                                                               f"检测到保存的进度与实际文件进度不一致！\n\n"
-                                                               f"差异:\n{diff_text}\n\n"
-                                                               f"保存的进度：\n"
-                                                               f"  片段: {saved_progress.get('current_segment_index', 0)}\n"
-                                                               f"  帧: {saved_progress.get('current_frame_in_segment', 0)}\n"
-                                                               f"  已处理片段: {len(saved_progress.get('processed_segments', []))}\n\n"
-                                                               f"检测到的进度：\n"
-                                                               f"  片段: {detected_progress.get('current_segment_index', 0)}\n"
-                                                               f"  帧: {detected_progress.get('current_frame_in_segment', 0)}\n"
-                                                               f"  已处理片段: {len(detected_progress.get('processed_segments', []))}\n\n"
-                                                               f"是否使用检测到的进度继续处理？（选择'是'使用检测进度，'否'使用保存进度）")
-
-                                if response:
-                                    # 使用检测到的进度
-                                    self.current_segment_index = detected_progress.get('current_segment_index', 0)
-                                    self.current_frame_in_segment = detected_progress.get('current_frame_in_segment', 0)
-                                    self.total_segments = detected_progress.get('total_segments', 0)
-                                    self.segments = detected_progress.get('segments', [])
-                                    self.processed_segments = detected_progress.get('processed_segments', [])
-                                    self.log("已使用检测到的进度")
-                                else:
-                                    # 使用保存的进度
-                                    self.current_segment_index = saved_progress.get('current_segment_index', 0)
-                                    self.current_frame_in_segment = saved_progress.get('current_frame_in_segment', 0)
-                                    self.total_segments = saved_progress.get('total_segments', 0)
-                                    self.segments = saved_progress.get('segments', [])
-                                    self.processed_segments = saved_progress.get('processed_segments', [])
-                                    self.log("已使用保存的进度")
-                            else:
-                                # 进度一致，使用保存的进度
-                                self.current_segment_index = saved_progress.get('current_segment_index', 0)
-                                self.current_frame_in_segment = saved_progress.get('current_frame_in_segment', 0)
-                                self.total_segments = saved_progress.get('total_segments', 0)
-                                self.segments = saved_progress.get('segments', [])
-                                self.processed_segments = saved_progress.get('processed_segments', [])
-                                self.log("进度一致，使用保存的进度")
-                        else:
-                            # 无法检测到实际进度，使用保存的进度
-                            self.current_segment_index = saved_progress.get('current_segment_index', 0)
-                            self.current_frame_in_segment = saved_progress.get('current_frame_in_segment', 0)
-                            self.total_segments = saved_progress.get('total_segments', 0)
-                            self.segments = saved_progress.get('segments', [])
-                            self.processed_segments = saved_progress.get('processed_segments', [])
-                            self.log("使用保存的进度（无法检测实际进度）")
-
-                    except Exception as e:
-                        self.log(f"加载进度数据时出错: {e}")
+                # 直接处理模式：只从04文件夹检测进度
+                processed_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
+                if os.path.exists(processed_dir):
+                    processed_files = [f for f in os.listdir(processed_dir)
+                                       if f.startswith("processed_") and f.endswith(".mp4")]
+                    if processed_files:
+                        # 提取最后一个处理文件的片段编号
+                        last_processed = sorted(processed_files)[-1]
+                        try:
+                            # 格式如：processed_segment_001.mp4
+                            segment_num = int(last_processed.split('_')[2].split('.')[0])
+                            self.current_segment_index = segment_num  # 下一个要处理的片段
+                            self.processed_segments = [f"segment_{i:03d}.mp4" for i in range(1, segment_num)]
+                            self.log(f"从04文件夹检测到进度: 已处理{segment_num}个片段，下一个片段={segment_num + 1}")
+                        except:
+                            self.current_segment_index = 0
+                            self.processed_segments = []
+                            self.log("无法解析处理文件名，从头开始处理")
+                    else:
                         self.current_segment_index = 0
-                        self.current_frame_in_segment = 0
                         self.processed_segments = []
-                        self.dup_frame_count = 0
+                        self.log("未找到已处理的片段，从头开始处理")
                 else:
-                    # 没有进度文件，从头开始
                     self.current_segment_index = 0
-                    self.current_frame_in_segment = 0
                     self.processed_segments = []
-                    self.dup_frame_count = 0
+                    self.log("未找到04文件夹，从头开始处理")
 
             # 重置重复帧计数（每个视频开始时重置）
             self.dup_frame_count = 0
@@ -2904,7 +2407,40 @@ class APISRVideoProcessor:
                 self.update_progress(5)
 
             # 步骤2: 分割视频（如果需要）
-            if not self.segments or self.current_segment_index == 0:
+            segments_dir = os.path.join(self.temp_base_dir, "01_original_segments")
+            if os.path.exists(segments_dir):
+                # 读取已有的片段
+                segment_files = []
+                for f in sorted(os.listdir(segments_dir)):
+                    if f.startswith("segment_") and f.endswith(".mp4"):
+                        segment_files.append(os.path.join(segments_dir, f))
+
+                if segment_files:
+                    self.segments = segment_files
+                    self.total_segments = len(self.segments)
+                    self.log(f"找到 {len(self.segments)} 个已有片段")
+                    self.update_progress(10)
+                else:
+                    # 没有片段，需要分割
+                    self.log("步骤2: 分割视频...")
+                    segment_duration = float(self.segment_duration.get())
+                    split_start = time.time()
+                    self.segments = self.split_video_by_keyframes(video_path, segment_duration, temp_dirs['base'])
+                    split_time = time.time() - split_start
+
+                    self.total_segments = len(self.segments)
+                    self.log(f"视频分割完成，共{len(self.segments)}段，耗时: {split_time:.2f}秒")
+                    self.update_progress(10)
+
+                    if not self.segments:
+                        raise ValueError("视频分割失败")
+
+                    # 重置进度
+                    self.current_segment_index = 0
+                    self.current_frame_in_segment = 0
+                    self.processed_segments = []
+            else:
+                # 需要分割视频
                 self.log("步骤2: 分割视频...")
                 segment_duration = float(self.segment_duration.get())
                 split_start = time.time()
@@ -2922,13 +2458,6 @@ class APISRVideoProcessor:
                 self.current_segment_index = 0
                 self.current_frame_in_segment = 0
                 self.processed_segments = []
-            else:
-                self.log(f"步骤2: 使用已有的 {len(self.segments)} 个片段")
-                self.update_progress(10)
-
-            # 保存初始进度
-            if not self.test_mode_var.get():
-                self.save_progress(force=True)
 
             # 步骤3: 处理视频片段
             self.log("步骤3: 处理视频片段...")
@@ -2941,70 +2470,46 @@ class APISRVideoProcessor:
                 # 检查是否被停止
                 if self.stopped:
                     self.log(f"处理被用户停止于片段 {i + 1}")
-                    if not self.test_mode_var.get():
-                        self.save_progress(force=True)
                     break
 
                 segment = self.segments[i]
                 segment_name = os.path.basename(segment)
 
-                # 检查是否已经处理过
-                if segment_name in self.processed_segments:
+                # 检查是否已经处理过（通过04文件夹判断）
+                processed_segment_path = os.path.join(temp_dirs['processed_segments'], f"processed_{segment_name}")
+                if os.path.exists(processed_segment_path):
                     self.log(f"跳过已处理的片段 {i + 1}/{len(self.segments)}: {segment_name}")
                     self.current_segment_index = i + 1
                     self.current_frame_in_segment = 0
+                    all_processed_segments.append(processed_segment_path)
+
+                    # 如果启用了立即合并，进行合并
+                    if self.immediate_merge_var.get() and not self.test_mode_var.get():
+                        merged_video = self.immediate_merge_segment(processed_segment_path, i)
+                        if merged_video:
+                            self.log(f"片段 {i + 1} 已立即合并到整体视频")
+
                     continue
 
                 self.log(f"处理片段 {i + 1}/{len(self.segments)}: {segment_name}")
                 segment_start = time.time()
 
-                if self.direct_mode and not self.test_mode_var.get():
-                    # 直接处理模式（使用moviepy）
+                if not self.enable_dup_detect_var.get() and not self.test_mode_var.get():
+                    # 直接处理模式（不进行重复帧检测）
                     processed_segment_path, audio_path = self.process_segment_directly(segment, i + 1)
                 else:
-                    # 逐帧处理模式（带重复帧检测）
-                    frame_files, audio_path = self.process_segment_frames(segment, i + 1)
-
-                    if frame_files and not self.test_mode_var.get():
-                        # 生成处理后的片段视频
-                        processed_segment_path = os.path.join(temp_dirs['processed_segments'],
-                                                              f"processed_{segment_name}")
-
-                        # 获取视频参数
-                        cap = cv2.VideoCapture(segment)
-                        fps = cap.get(cv2.CAP_PROP_FPS)
-                        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        cap.release()
-
-                        # 计算输出尺寸
-                        scale = int(self.scale_var.get())
-                        downsample_threshold = int(self.downsample_threshold.get())
-                        short_side = min(height, width)
-
-                        if downsample_threshold != -1 and short_side > downsample_threshold:
-                            rescale_factor = short_side / downsample_threshold
-                        else:
-                            rescale_factor = 1
-
-                        output_width = int(width * scale / rescale_factor)
-                        output_height = int(height * scale / rescale_factor)
-
-                        # 将帧转换为视频
-                        self.frames_to_video(frame_files, processed_segment_path, fps, output_width, output_height,
-                                             audio_path)
+                    # 逐帧处理模式（带重复帧检测或测试模式）
+                    processed_segment_path, audio_path = self.process_segment_frames(segment, i + 1)
 
                 segment_time = time.time() - segment_start
                 total_segment_time += segment_time
 
                 # 检查是否被停止
                 if self.stopped:
-                    if not self.test_mode_var.get():
-                        self.save_progress(force=True)
                     break
 
                 if not self.test_mode_var.get() and processed_segment_path:
-                    # 立即合并视频（如果启用）
+                    # 如果启用了立即合并，进行合并
                     if self.immediate_merge_var.get():
                         merged_video = self.immediate_merge_segment(processed_segment_path, i)
                         if merged_video:
@@ -3017,17 +2522,6 @@ class APISRVideoProcessor:
                 # 更新进度
                 self.current_segment_index = i + 1
                 self.current_frame_in_segment = 0
-                self.processed_segments.append(segment_name)
-                self.update_progress_info()
-
-                # 保存进度（非测试模式）
-                if not self.test_mode_var.get():
-                    self.save_progress(force=True)
-
-                # 清理当前片段的帧目录（如果是逐帧处理模式）
-                if not self.direct_mode and not self.test_mode_var.get():
-                    self.log(f"清理片段 {i + 1} 的临时帧文件...")
-                    self.cleanup_segment_frame_dirs(i + 1)
 
                 # 更新总体进度
                 overall_progress = 10 + (i + 1) / len(self.segments) * 60
@@ -3038,10 +2532,7 @@ class APISRVideoProcessor:
                     torch.cuda.empty_cache()
 
             if self.stopped:
-                if not self.test_mode_var.get():
-                    self.log(
-                        f"处理已停止，进度已保存于片段 {self.current_segment_index} 的第 {self.current_frame_in_segment} 帧")
-                    self.save_progress(force=True)
+                self.log(f"处理已停止")
                 return False
 
             # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
@@ -3120,15 +2611,8 @@ class APISRVideoProcessor:
                 self.log("测试模式：跳过视频合成步骤")
                 self.update_progress(95)
 
-            # 步骤5: 清理临时文件和进度记录
+            # 步骤5: 清理临时文件
             self.log("步骤5: 清理临时文件...")
-
-            # 删除进度文件（非测试模式）
-            if not self.test_mode_var.get():
-                progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
-                if os.path.exists(progress_file):
-                    os.remove(progress_file)
-
             self.update_progress(100)
 
             # 视频处理完成统计
@@ -3146,9 +2630,9 @@ class APISRVideoProcessor:
                 if total_frames_processed > 0:
                     self.log(f"平均每帧处理时间: {avg_frame_time:.3f}秒")
                 # 显示重复帧统计
-                if self.enable_dup_detect_var.get() and not self.direct_mode:
+                if self.enable_dup_detect_var.get():
                     self.log(f"总计检测到 {self.dup_frame_count} 个重复帧，已复用处理结果，加速了处理速度")
-                elif self.direct_mode:
+                else:
                     self.log(f"直接处理模式完成，处理速度更快，内存占用更低")
 
             # 重置状态
@@ -3172,9 +2656,6 @@ class APISRVideoProcessor:
 
         except Exception as e:
             self.log(f"处理视频失败: {str(e)}")
-            # 保存进度以便恢复（非测试模式）
-            if not self.test_mode_var.get():
-                self.save_progress(force=True)
             return False
 
     def concatenate_videos(self, video_list, output_path):
@@ -3259,7 +2740,7 @@ class APISRVideoProcessor:
             self.process_btn.config(state='disabled')
 
             # 根据处理模式设置暂停按钮状态
-            if self.direct_mode:
+            if not self.enable_dup_detect_var.get():
                 self.pause_btn.config(state='disabled')  # 直接处理模式禁用暂停
                 self.log("直接处理模式：暂停功能已禁用")
             else:
@@ -3293,8 +2774,8 @@ class APISRVideoProcessor:
                     break
 
             if self.stopped:
-                self.log(f"批量处理已停止，进度已保存")
-                self.update_status("已停止，进度已保存", "orange")
+                self.log(f"批量处理已停止")
+                self.update_status("已停止", "orange")
                 return
 
             # 所有视频处理完成
@@ -3318,8 +2799,6 @@ class APISRVideoProcessor:
             self.log(f"批量处理失败: {str(e)}")
             self.update_status(f"处理失败: {str(e)}", "red")
             messagebox.showerror("错误", f"处理失败: {str(e)}")
-            # 保存进度以便恢复
-            self.save_progress(force=True)
         finally:
             self.processing = False
             self.paused = False
@@ -3330,11 +2809,16 @@ class APISRVideoProcessor:
 
             # 清理GPU内存
             if self.generator and not self.test_mode_var.get():
-                del self.generator
-                torch.cuda.empty_cache()
-
-            # 保存配置
-            self.save_config()
+                try:
+                    # 确保模型从GPU移除
+                    self.generator = self.generator.cpu()
+                    del self.generator
+                    self.generator = None
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # 等待CUDA操作完成
+                    self.log("GPU内存已完全释放")
+                except Exception as e:
+                    self.log(f"清理GPU内存时出错: {e}")
 
     def start_processing(self):
         """开始处理"""
@@ -3381,7 +2865,7 @@ class APISRVideoProcessor:
             return
 
         # 直接处理模式不支持暂停
-        if self.direct_mode:
+        if not self.enable_dup_detect_var.get():
             messagebox.showinfo("提示", "直接处理模式不支持暂停功能")
             return
 
@@ -3400,82 +2884,34 @@ class APISRVideoProcessor:
             self.paused = True
             self.pause_btn.config(text="▶ 继续")
             self.update_status("已暂停", "orange")
-            self.log("处理暂停，保存进度...")
-            self.save_progress(force=True)
+            self.log("处理暂停")
 
     def stop_processing(self):
         """停止处理"""
         if not self.processing:
             return
 
-        response = messagebox.askyesnocancel("停止处理",
-                                             "请选择停止方式：\n\n"
-                                             "是：保存进度并停止，下次可以继续\n"
-                                             "否：直接停止，不保存进度\n"
-                                             "取消：返回继续处理")
+        response = messagebox.askyesno("停止处理",
+                                       "是否确认停止处理？\n\n"
+                                       "停止后进度将不会保存，下次需要重新开始处理。")
 
-        if response is None:  # 取消
+        if not response:
             return
 
-        if response:  # 是：保存进度并停止
-            self.log("正在停止处理并保存进度...")
-            self.update_status("正在停止并保存进度...", "orange")
-            self.stopped = True
-            self.paused = False  # 确保暂停状态被清除
+        self.log("正在停止处理...")
+        self.update_status("正在停止...", "orange")
+        self.stopped = True
+        self.paused = False  # 确保暂停状态被清除
 
-            # 通知暂停的线程继续（如果是暂停状态）
-            with self.pause_cv:
-                self.pause_cv.notify_all()
+        # 通知暂停的线程继续（如果是暂停状态）
+        with self.pause_cv:
+            self.pause_cv.notify_all()
 
-            # 等待处理线程响应
-            time.sleep(0.5)
+        # 等待处理线程响应
+        time.sleep(0.5)
 
-            # 强制保存进度
-            self.save_progress(force=True)
-
-            # 等待处理线程结束
-            if self.processing_thread and self.processing_thread.is_alive():
-                self.processing_thread.join(timeout=2.0)
-
-            self.log("处理已停止，进度已保存")
-            self.update_status("已停止，进度已保存", "orange")
-
-        else:  # 否：直接停止，不保存进度
-            self.log("正在停止处理，不保存进度...")
-            self.update_status("正在停止...", "orange")
-            self.stopped = True
-            self.paused = False  # 确保暂停状态被清除
-
-            # 通知暂停的线程继续（如果是暂停状态）
-            with self.pause_cv:
-                self.pause_cv.notify_all()
-
-            # 等待处理线程响应
-            time.sleep(0.5)
-
-            # 删除进度文件
-            if self.temp_base_dir:
-                progress_file = os.path.join(self.temp_base_dir, "progress_data.pkl")
-                if os.path.exists(progress_file):
-                    try:
-                        os.remove(progress_file)
-                        self.log("已删除进度文件")
-                    except:
-                        pass
-
-            # 等待处理线程结束
-            if self.processing_thread and self.processing_thread.is_alive():
-                self.processing_thread.join(timeout=2.0)
-
-            self.log("处理已停止，进度未保存")
-            self.update_status("已停止，进度未保存", "orange")
-
-            # 重置进度
-            self.current_video_index = 0
-            self.current_segment_index = 0
-            self.current_frame_in_segment = 0
-            self.dup_frame_count = 0
-            self.update_dup_info(0)
+        self.log("处理已停止")
+        self.update_status("已停止", "orange")
 
         # 重置按钮状态
         self.process_btn.config(state='normal')
@@ -3504,40 +2940,25 @@ class APISRVideoProcessor:
         self.save_config()
 
         if self.processing:
-            response = messagebox.askyesnocancel("退出",
-                                                 "处理仍在进行中，您可以选择:\n\n"
-                                                 "是: 保存进度并退出\n"
-                                                 "否: 不保存进度直接退出\n"
-                                                 "取消: 继续处理")
+            response = messagebox.askyesno("退出",
+                                           "处理仍在进行中，是否确认退出？\n\n"
+                                           "退出后进度将不会保存，下次需要重新开始处理。")
 
-            if response is True:  # 保存进度并退出
-                self.log("保存进度并退出...")
-                self.save_progress(force=True)
-                self.processing = False
-                self.stopped = True
-                self.paused = False
+            if not response:
+                return
 
-                # 通知暂停的线程继续（如果是暂停状态）
-                with self.pause_cv:
-                    self.pause_cv.notify_all()
+            self.log("正在停止处理并退出...")
+            self.processing = False
+            self.stopped = True
+            self.paused = False
 
-                time.sleep(1.0)  # 给线程更多时间响应
-                self.root.destroy()
-            elif response is False:  # 直接退出
-                self.log("直接退出，不保存进度")
-                self.processing = False
-                self.stopped = True
-                self.paused = False
+            # 通知暂停的线程继续（如果是暂停状态）
+            with self.pause_cv:
+                self.pause_cv.notify_all()
 
-                # 通知暂停的线程继续（如果是暂停状态）
-                with self.pause_cv:
-                    self.pause_cv.notify_all()
+            time.sleep(1.0)  # 给线程更多时间响应
 
-                time.sleep(1.0)  # 给线程更多时间响应
-                self.root.destroy()
-            # 如果选择取消，什么都不做，继续处理
-        else:
-            self.root.destroy()
+        self.root.destroy()
 
 
 def main():

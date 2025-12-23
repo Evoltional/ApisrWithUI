@@ -90,7 +90,7 @@ class APISRVideoProcessor:
         self.use_hash_var = tk.BooleanVar(value=True)
         self.test_mode_var = tk.BooleanVar(value=False)
         self.enable_history_var = tk.BooleanVar(value=True)
-        self.history_size_var = tk.StringVar(value="20")
+        self.history_size_var = tk.StringVar(value="5")
         self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
         self.last_test_mode_state = False  # 记录上一次的测试模式状态
 
@@ -145,6 +145,10 @@ class APISRVideoProcessor:
         self.pause_lock = threading.Lock()
         self.pause_cv = threading.Condition(self.pause_lock)
         self.should_sleep = False
+
+        # 新增：内存监控
+        self.monitor_thread = None
+        self.memory_check_interval = 30  # 30秒检查一次内存
 
         # 设置历史帧数量验证
         self.setup_history_size_validation()
@@ -231,7 +235,6 @@ class APISRVideoProcessor:
             # 获取当前值
             current_value = self.history_size_var.get()
 
-            # 如果不是数字，恢复为默认值20
             if not current_value.isdigit():
                 self.history_size_var.set("20")
                 return
@@ -240,13 +243,12 @@ class APISRVideoProcessor:
             try:
                 history_size = int(current_value)
 
-                # 限制范围在1-100之间
+                # 限制范围在1-200之间（减少内存占用）
                 if history_size < 1:
                     self.history_size_var.set("1")
-                elif history_size > 100:
-                    self.history_size_var.set("100")
+                elif history_size > 200:
+                    self.history_size_var.set("200")
             except ValueError:
-                # 如果转换失败，恢复为默认值20
                 self.history_size_var.set("20")
 
         # 添加trace监听变量变化
@@ -267,7 +269,7 @@ class APISRVideoProcessor:
                         font=('Segoe UI', 10, 'bold'))
 
     def init_history_cache(self):
-        """初始化历史帧缓存"""
+        """初始化历史帧缓存 - 修复版本"""
         # 检查历史帧开关
         if not self.enable_history_var.get():
             # 如果历史帧功能关闭，使用默认值1（只与前一帧比较）
@@ -279,9 +281,9 @@ class APISRVideoProcessor:
                 if history_size < 1:
                     history_size = 1
                     self.history_size_var.set("1")
-                elif history_size > 100:
-                    history_size = 100
-                    self.history_size_var.set("100")
+                elif history_size > 200:  # 限制最大历史帧数，防止内存占用过大
+                    history_size = 200
+                    self.history_size_var.set("200")
             except:
                 history_size = 20  # 默认值
                 self.history_size_var.set("20")
@@ -297,6 +299,19 @@ class APISRVideoProcessor:
 
         self.frame_sr_history = collections.deque(maxlen=history_size)
         self.frame_idx_history = collections.deque(maxlen=history_size)
+
+    def clear_history_cache(self):
+        """清空历史缓存"""
+        if hasattr(self, 'frame_history'):
+            self.frame_history.clear()
+        if hasattr(self, 'frame_hash_history'):
+            self.frame_hash_history.clear()
+        if hasattr(self, 'frame_thumbnail_history') and self.frame_thumbnail_history:
+            self.frame_thumbnail_history.clear()
+        if hasattr(self, 'frame_sr_history'):
+            self.frame_sr_history.clear()
+        if hasattr(self, 'frame_idx_history'):
+            self.frame_idx_history.clear()
 
     def setup_ui(self):
         """设置UI布局"""
@@ -618,7 +633,8 @@ class APISRVideoProcessor:
                                        state='normal' if self.enable_history_var.get() else 'disabled')
         self.history_entry.pack(side=tk.LEFT, padx=(0, 5))
 
-        ttk.Label(history_size_frame, text="(1-100)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
+        ttk.Label(history_size_frame, text="(1-20)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(
+            side=tk.LEFT)  # 修改为1-20
 
         row += 1
 
@@ -970,7 +986,7 @@ class APISRVideoProcessor:
                 'enable_history': self.enable_history_var.get(),
                 'history_size': int(self.history_size_var.get()),
                 'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
-                'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                'last_saved': datetime.now().strftime("%Y-%m-d %H:%M:%S")
             }
 
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -980,6 +996,62 @@ class APISRVideoProcessor:
             # self.log(f"配置已自动保存到 {self.config_file}")
         except Exception as e:
             self.log(f"保存配置文件时出错: {e}")
+
+    # ============================================================
+    # 内存监控和清理函数
+    # ============================================================
+
+    def add_memory_monitoring(self):
+        """添加内存使用监控功能"""
+        try:
+            if torch.cuda.is_available():
+                import GPUtil
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]
+                    self.log(f"GPU内存使用: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB ({gpu.memoryUtil * 100:.1f}%)")
+        except ImportError:
+            # 如果GPUtil不可用，跳过
+            pass
+        except Exception as e:
+            # 监控出错时不中断处理
+            pass
+
+    def start_memory_monitor(self):
+        """启动内存监控线程"""
+
+        def monitor_loop():
+            while self.processing:
+                time.sleep(self.memory_check_interval)  # 每30秒检查一次
+                try:
+                    if not self.paused and not self.stopped:
+                        self.add_memory_monitoring()
+                except:
+                    pass
+
+        self.monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+    def cleanup_memory(self):
+        """清理内存"""
+        try:
+            # 清理GPU内存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            # 清理Python内存
+            import gc
+            gc.collect()
+
+            # 清理OpenCV缓冲区（如果有）
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass
+
+        except Exception as e:
+            self.log(f"内存清理时出错: {e}")
 
     # ============================================================
     # 模型加载函数（从test_utils.py整合）
@@ -1579,7 +1651,7 @@ class APISRVideoProcessor:
         return generator
 
     def process_single_frame(self, frame):
-        """处理单帧图像"""
+        """处理单帧图像 - 修复内存泄漏版本"""
         start_time = time.time()
 
         if self.test_mode_var.get():
@@ -1608,6 +1680,9 @@ class APISRVideoProcessor:
             new_w = int(w / rescale_factor)
             new_h = int(h / rescale_factor)
             frame_rgb = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            # 立即清理中间变量
+            del frame
+            frame = None
 
         # 裁剪（如果需要）
         if self.crop_for_4x_var.get() and scale == 4:
@@ -1622,8 +1697,12 @@ class APISRVideoProcessor:
         # 推理阶段时间统计
         inference_start = time.time()
 
-        # 转换为tensor并进行推理（与inference.py保持一致）
+        # 转换为tensor并进行推理
         img_tensor = ToTensor()(frame_rgb).unsqueeze(0)  # 形状: [1, 3, H, W]
+
+        # 立即清理不再需要的变量
+        del frame_rgb
+        frame_rgb = None
 
         if torch.cuda.is_available():
             img_tensor = img_tensor.cuda()
@@ -1639,10 +1718,23 @@ class APISRVideoProcessor:
         # 后处理阶段时间统计
         postprocess_start = time.time()
 
+        # 将结果移动到CPU，并释放GPU内存
+        result_cpu = result[0].cpu().detach()
+
+        # 立即清理GPU变量
+        del img_tensor
+        del result
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
         # 转换为numpy数组，调整通道顺序，并缩放到0-255
-        result_np = result[0].cpu().detach().numpy()
+        result_np = result_cpu.numpy()
         result_np = np.transpose(result_np, (1, 2, 0))  # 从 [C, H, W] 转换为 [H, W, C]
         result_np = np.clip(result_np * 255.0, 0, 255).astype(np.uint8)
+
+        # 清理中间变量
+        del result_cpu
 
         # 如果需要，缩放回原始大小
         if downsample_threshold != -1 and short_side > downsample_threshold:
@@ -1661,22 +1753,53 @@ class APISRVideoProcessor:
         return result_np
 
     def process_frame_with_enhanced_dup_detect(self, frame, frame_idx):
-        """处理单帧，包含增强的重复帧检测"""
+        """处理单帧，包含增强的重复帧检测 - 修复内存泄漏版本"""
         start_time = time.time()
         is_duplicate = False
 
-        # 检查是否为重复帧
-        is_duplicate, matched_sr_result, current_hash, current_thumbnail = \
-            self.check_frame_duplicate_enhanced(frame, frame_idx)
+        try:
+            # 检查是否为重复帧
+            is_duplicate, matched_sr_result, current_hash, current_thumbnail = \
+                self.check_frame_duplicate_enhanced(frame, frame_idx)
 
-        if is_duplicate and matched_sr_result is not None:
-            # 找到重复帧，直接使用历史超分辨率结果
-            result_np = matched_sr_result
+            if is_duplicate and matched_sr_result is not None:
+                # 找到重复帧，直接使用历史超分辨率结果
+                result_np = matched_sr_result.copy()  # 创建副本
 
-            # 更新历史记录（使用匹配的帧信息）
-            if current_hash is None and self.use_hash_var.get():
-                current_hash, _ = self.calculate_frame_hash(frame)
-            if current_thumbnail is None and self.use_ssim_var.get():
+                # 计算当前帧的信息（如果需要）
+                if current_hash is None and self.use_hash_var.get():
+                    current_hash, _ = self.calculate_frame_hash(frame)
+                if current_thumbnail is None and self.use_ssim_var.get():
+                    h, w = frame.shape[:2]
+                    if h > 180 or w > 320:
+                        new_h = 180
+                        new_w = int(w * (180 / h))
+                        current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                    else:
+                        current_thumbnail = frame.copy()
+
+                # 添加帧到历史记录
+                self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
+
+                total_elapsed = time.time() - start_time
+                return result_np, current_hash, current_thumbnail, is_duplicate
+
+            # 非重复帧，进行超分辨率处理
+            process_start = time.time()
+            result_np = self.process_single_frame(frame)
+            process_time = time.time() - process_start
+
+            # 计算当前帧的信息
+            if self.use_hash_var.get():
+                hash_start = time.time()
+                if current_hash is None:
+                    current_hash, hash_time = self.calculate_frame_hash(frame)
+                else:
+                    hash_time = time.time() - hash_start
+            else:
+                hash_time = 0
+
+            if self.use_ssim_var.get() and current_thumbnail is None:
                 h, w = frame.shape[:2]
                 if h > 180 or w > 320:
                     new_h = 180
@@ -1685,40 +1808,25 @@ class APISRVideoProcessor:
                 else:
                     current_thumbnail = frame.copy()
 
+            # 更新历史记录
             self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
 
-            total_elapsed = time.time() - start_time
+            total_time = time.time() - start_time
+
+            # 定期清理内存
+            if frame_idx % 50 == 0:
+                self.cleanup_memory()
+
+            if total_time > 0.3:  # 只记录耗时较长的帧处理
+                self.log(f"帧 {frame_idx:04d}: 超分处理耗时: {process_time:.3f}s，总耗时: {total_time:.3f}s")
+
             return result_np, current_hash, current_thumbnail, is_duplicate
 
-        # 非重复帧，进行超分辨率处理
-        process_start = time.time()
-        result_np = self.process_single_frame(frame)
-        process_time = time.time() - process_start
-
-        # 计算当前帧的信息
-        hash_start = time.time()
-        if current_hash is None and self.use_hash_var.get():
-            current_hash, hash_time = self.calculate_frame_hash(frame)
-        else:
-            hash_time = time.time() - hash_start
-
-        if current_thumbnail is None and self.use_ssim_var.get():
-            h, w = frame.shape[:2]
-            if h > 180 or w > 320:
-                new_h = 180
-                new_w = int(w * (180 / h))
-                current_thumbnail = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            else:
-                current_thumbnail = frame.copy()
-
-        # 更新历史记录
-        self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
-
-        total_time = time.time() - start_time
-        if total_time > 0.3:  # 只记录耗时较长的帧处理
-            self.log(f"帧 {frame_idx:04d}: 超分处理耗时: {process_time:.3f}s，总耗时: {total_time:.3f}s")
-
-        return result_np, current_hash, current_thumbnail, is_duplicate
+        except Exception as e:
+            self.log(f"帧 {frame_idx} 处理出错: {e}")
+            # 发生错误时清理内存
+            self.cleanup_memory()
+            raise
 
     def detect_progress_from_folders(self):
         """从文件夹内容检测进度"""
@@ -1969,6 +2077,17 @@ class APISRVideoProcessor:
                 if self.stopped:
                     break
 
+            # 每处理50帧清理一次内存
+            if frame_idx % 50 == 0 and not self.test_mode_var.get():
+                self.cleanup_memory()
+                self.log(f"已清理内存（处理到第 {frame_idx} 帧）")
+
+            # 每处理100帧清理一次历史缓存
+            if frame_idx % 100 == 0 and self.enable_dup_detect_var.get():
+                self.clear_history_cache()
+                self.init_history_cache()  # 重新初始化
+                self.log(f"已清空历史缓存（处理到第 {frame_idx} 帧）")
+
             # 读取帧
             read_start = time.time()
             ret, frame = cap.read()
@@ -2033,10 +2152,6 @@ class APISRVideoProcessor:
 
             frame_idx += 1
 
-            # 每处理50帧清理一次GPU内存
-            if frame_idx % 50 == 0 and not self.test_mode_var.get():
-                torch.cuda.empty_cache()
-
         cap.release()
 
         # 记录片段处理统计
@@ -2062,12 +2177,7 @@ class APISRVideoProcessor:
                 self.log(f"  重复帧节省时间估算: {segment_dup_count * avg_frame_time:.2f}秒")
 
         # 清空历史缓存以释放内存
-        self.frame_history.clear()
-        self.frame_hash_history.clear()
-        if hasattr(self, 'frame_thumbnail_history'):
-            self.frame_thumbnail_history.clear()
-        self.frame_sr_history.clear()
-        self.frame_idx_history.clear()
+        self.clear_history_cache()
 
         # 只有在片段完全处理完且没有停止时才生成视频
         if not self.stopped and frame_idx >= total_frames and not self.test_mode_var.get() and frame_files:
@@ -2374,6 +2484,10 @@ class APISRVideoProcessor:
                 avg_frame_time = total_frame_time / (frame_idx + 1)
                 self.log(f"已处理 {frame_idx + 1}/{total_frames} 帧，平均每帧耗时: {avg_frame_time:.3f}秒")
 
+            # 每处理50帧清理一次内存
+            if frame_idx % 50 == 0:
+                self.cleanup_memory()
+
         # 关闭写入器和视频
         writer.close()
         video.close()
@@ -2651,9 +2765,8 @@ class APISRVideoProcessor:
                 overall_progress = 10 + (i + 1) / len(self.segments) * 60
                 self.update_progress(overall_progress)
 
-                # 处理完一个片段后清理GPU内存
-                if not self.test_mode_var.get():
-                    torch.cuda.empty_cache()
+                # 处理完一个片段后清理内存
+                self.cleanup_memory()
 
             if self.stopped:
                 self.log(f"处理已停止")
@@ -2804,12 +2917,7 @@ class APISRVideoProcessor:
             self.update_dup_info(0)
 
             # 清空历史缓存
-            self.frame_history.clear()
-            self.frame_hash_history.clear()
-            if hasattr(self, 'frame_thumbnail_history'):
-                self.frame_thumbnail_history.clear()
-            self.frame_sr_history.clear()
-            self.frame_idx_history.clear()
+            self.clear_history_cache()
 
             return True
 
@@ -2886,8 +2994,8 @@ class APISRVideoProcessor:
                     self.ssim_threshold_var.set("0.98")
                     return
 
-                if history_size < 1 or history_size > 100:
-                    messagebox.showwarning("警告", "历史帧数量必须在1-100之间")
+                if history_size < 1 or history_size > 200:
+                    messagebox.showwarning("警告", "历史帧数量必须在1-200之间")
                     self.history_size_var.set("20")
                     return
             except ValueError:
@@ -2912,6 +3020,9 @@ class APISRVideoProcessor:
 
             self.stop_btn.config(state='normal')
             self.update_status("批量处理中...", "blue")
+
+            # 启动内存监控
+            self.start_memory_monitor()
 
             # 处理每个视频
             total_videos = len(self.input_paths)
@@ -3027,9 +3138,9 @@ class APISRVideoProcessor:
                 self.batch_size_var.set("1")
                 return
 
-            if history_size < 1 or history_size > 100:
-                messagebox.showwarning("警告", "历史帧数量必须在1-100之间")
-                self.history_size_var.set("20")
+            if history_size < 1 or history_size > 20:
+                messagebox.showwarning("警告", "历史帧数量必须在1-20之间")
+                self.history_size_var.set("5")
                 return
         except ValueError:
             messagebox.showerror("错误", "参数格式错误")
@@ -3073,8 +3184,7 @@ class APISRVideoProcessor:
             return
 
         response = messagebox.askyesno("停止处理",
-                                       "是否确认停止处理？\n\n"
-                                       "停止后进度将不会保存，下次需要重新开始处理。")
+                                       "是否确认停止处理？")
 
         if not response:
             return

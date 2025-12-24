@@ -92,6 +92,7 @@ class APISRVideoProcessor:
         self.enable_history_var = tk.BooleanVar(value=True)
         self.history_size_var = tk.StringVar(value="5")
         self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
+        self.video_encoder_mode = tk.StringVar(value="auto")  # 新增：视频编码器模式
         self.last_test_mode_state = False  # 记录上一次的测试模式状态
 
         # 设置样式
@@ -449,6 +450,7 @@ class APISRVideoProcessor:
             (self.hash_threshold_var, 'w'),
             (self.ssim_threshold_var, 'w'),
             (self.history_size_var, 'w'),
+            (self.video_encoder_mode, 'w'),  # 新增：视频编码器模式
         ]
 
         for var, mode in variables_to_trace:
@@ -558,9 +560,10 @@ class APISRVideoProcessor:
         ttk.Checkbutton(perf_frame, text="FP16加速",
                         variable=self.float16_var).grid(row=2, column=1, sticky=tk.W, pady=2)
 
-        ttk.Label(perf_frame, text="边缘处理:").grid(row=3, column=0, sticky=tk.W, pady=2, padx=(0, 5))
-        ttk.Checkbutton(perf_frame, text="4倍缩放时裁剪",
-                        variable=self.crop_for_4x_var).grid(row=3, column=1, sticky=tk.W, pady=2)
+        ttk.Label(perf_frame, text="视频编码:").grid(row=3, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        encoder_combo = ttk.Combobox(perf_frame, textvariable=self.video_encoder_mode,
+                                     values=["auto", "opencv", "ffmpeg"], width=10, state="readonly")
+        encoder_combo.grid(row=3, column=1, sticky=tk.W, pady=2)
 
         row += 1
 
@@ -665,7 +668,8 @@ class APISRVideoProcessor:
 4. 历史帧数量可配置
 5. 配置自动保存
 6. 测试模式有确认窗口
-7. 可立即合成视频"""
+7. 可立即合成视频
+8. 多种视频编码器支持"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -953,6 +957,8 @@ class APISRVideoProcessor:
                     self.history_size_var.set(str(config['history_size']))
                 if 'immediate_merge' in config:
                     self.immediate_merge_var.set(config['immediate_merge'])
+                if 'video_encoder_mode' in config:  # 新增：视频编码器模式
+                    self.video_encoder_mode.set(config['video_encoder_mode'])
 
                 self.log(f"已从 {self.config_file} 加载配置")
 
@@ -986,6 +992,7 @@ class APISRVideoProcessor:
                 'enable_history': self.enable_history_var.get(),
                 'history_size': int(self.history_size_var.get()),
                 'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
+                'video_encoder_mode': self.video_encoder_mode.get(),  # 保存视频编码器模式
                 'last_saved': datetime.now().strftime("%Y-%m-d %H:%M:%S")
             }
 
@@ -2207,8 +2214,33 @@ class APISRVideoProcessor:
                 self.log("没有帧文件可处理")
             return None, None
 
+    def check_opencv_encoder_support(self):
+        """检查OpenCV编码器支持"""
+        test_size = (100, 100)
+        test_encoders = ['mp4v', 'avc1', 'MJPG', 'XVID']
+
+        for encoder in test_encoders:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*encoder)
+                out = cv2.VideoWriter(tempfile.mktemp(suffix='.mp4'), fourcc, 1, test_size)
+                if out.isOpened():
+                    out.release()
+                    return True
+            except:
+                pass
+        return False
+
     def frames_to_video(self, frame_files, output_path, fps, width, height, audio_path=None):
-        """将帧序列转换为视频（修复版）"""
+        """将帧序列转换为视频"""
+        encoder_mode = self.video_encoder_mode.get()
+
+        if encoder_mode == "ffmpeg" or (encoder_mode == "auto" and not self.check_opencv_encoder_support()):
+            return self.frames_to_video_alternative(frame_files, output_path, fps, width, height, audio_path)
+        else:
+            return self.frames_to_video_opencv(frame_files, output_path, fps, width, height, audio_path)
+
+    def frames_to_video_opencv(self, frame_files, output_path, fps, width, height, audio_path=None):
+        """将帧序列转换为视频（使用OpenCV）"""
         self.log(f"正在生成视频: {output_path}")
         start_time = time.time()
 
@@ -2219,17 +2251,46 @@ class APISRVideoProcessor:
         # 创建临时视频文件（无音频）
         temp_video_path = output_path.replace('.mp4', '_temp.mp4')
 
-        # 使用更可靠的编码器
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # 使用H.264编码器
-        out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+        # 尝试多种编码器，避免OpenH264问题
+        encoders_to_try = [
+            ('mp4v', 'mp4'),  # MPEG-4 编码
+            ('MJPG', 'avi'),  # Motion JPEG
+            ('XVID', 'avi'),  # XVID 编码
+            ('I420', 'avi'),  # YUV 编码
+            ('IYUV', 'avi'),  # YUV 编码
+            ('DIVX', 'avi')  # DivX 编码
+        ]
 
-        if not out.isOpened():
-            self.log("错误: 无法创建视频写入器，尝试其他编码器")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 使用MPEG-4编码器
-            out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
-            if not out.isOpened():
-                self.log("错误: 仍然无法创建视频写入器")
-                return False
+        out = None
+        selected_encoder = None
+        selected_ext = None
+
+        # 尝试不同的编码器
+        for codec, ext in encoders_to_try:
+            try:
+                if ext == 'avi':
+                    temp_video_path = output_path.replace('.mp4', '_temp.avi')
+                else:
+                    temp_video_path = output_path.replace('.mp4', '_temp.mp4')
+
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
+
+                if out.isOpened():
+                    selected_encoder = codec
+                    selected_ext = ext
+                    self.log(f"使用编码器: {codec}，文件格式: {ext}")
+                    break
+                else:
+                    out.release()
+            except Exception as e:
+                if out:
+                    out.release()
+                continue
+
+        if not out or not out.isOpened():
+            self.log("错误: 无法创建视频写入器，尝试使用ffmpeg方式")
+            return self.frames_to_video_alternative(frame_files, output_path, fps, width, height, audio_path)
 
         # 按顺序写入所有帧
         write_start = time.time()
@@ -2272,7 +2333,7 @@ class APISRVideoProcessor:
         # 确保视频文件创建成功
         if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
             self.log(f"错误: 视频文件创建失败: {temp_video_path}")
-            return False
+            return self.frames_to_video_alternative(frame_files, output_path, fps, width, height, audio_path)
 
         file_size = os.path.getsize(temp_video_path) / (1024 * 1024)  # 转换为MB
         self.log(f"临时视频创建成功，大小: {file_size:.2f} MB，写入耗时: {write_total_time:.2f}秒")
@@ -2284,7 +2345,28 @@ class APISRVideoProcessor:
             merge_start = time.time()
 
             try:
-                # 使用改进的合并命令
+                # 如果生成的是AVI文件，需要转换格式
+                if selected_ext == 'avi':
+                    # 先转换为mp4
+                    mp4_temp = temp_video_path.replace('.avi', '_converted.mp4')
+                    convert_cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_path,
+                        '-c:v', 'libx264',
+                        '-preset', 'medium',
+                        '-crf', '23',
+                        '-loglevel', 'quiet',
+                        mp4_temp
+                    ]
+
+                    subprocess.run(convert_cmd, check=True, capture_output=True, text=True)
+
+                    if os.path.exists(mp4_temp):
+                        # 删除原始AVI文件
+                        os.remove(temp_video_path)
+                        temp_video_path = mp4_temp
+
+                # 合并音频
                 cmd = [
                     'ffmpeg', '-y',
                     '-i', temp_video_path,
@@ -2322,6 +2404,8 @@ class APISRVideoProcessor:
                         '-i', temp_video_path,
                         '-i', audio_path,
                         '-c:v', 'libx264',
+                        '-preset', 'medium',
+                        '-crf', '23',
                         '-c:a', 'aac',
                         '-b:a', '192k',
                         '-strict', 'experimental',
@@ -2347,7 +2431,28 @@ class APISRVideoProcessor:
         else:
             # 如果没有音频，直接使用临时视频文件
             if os.path.exists(temp_video_path):
-                shutil.move(temp_video_path, output_path)
+                # 如果是AVI格式，转换为MP4
+                if selected_ext == 'avi':
+                    self.log("将AVI转换为MP4...")
+                    convert_cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_path,
+                        '-c:v', 'libx264',
+                        '-preset', 'medium',
+                        '-crf', '23',
+                        '-loglevel', 'quiet',
+                        output_path
+                    ]
+
+                    try:
+                        subprocess.run(convert_cmd, check=True, capture_output=True, text=True)
+                        os.remove(temp_video_path)
+                    except Exception as e:
+                        self.log(f"转换失败: {e}")
+                        shutil.move(temp_video_path, output_path)
+                else:
+                    shutil.move(temp_video_path, output_path)
+
                 total_time = time.time() - start_time
                 self.log(f"视频生成成功，总耗时: {total_time:.2f}秒")
                 self.log(f"生成视频: {output_path}，分辨率: {width}x{height}，帧率: {fps}，帧数: {frame_count}")
@@ -2356,6 +2461,85 @@ class APISRVideoProcessor:
                 self.log(f"错误: 视频文件未创建: {temp_video_path}")
 
         return False
+
+    def frames_to_video_alternative(self, frame_files, output_path, fps, width, height, audio_path=None):
+        """替代方法：使用ffmpeg直接生成视频（避免OpenCV编码器问题）"""
+        self.log("使用ffmpeg直接生成视频...")
+        start_time = time.time()
+
+        if not frame_files:
+            self.log("错误: 没有可用的帧文件")
+            return False
+
+        # 创建临时文件列表
+        list_file = tempfile.mktemp(suffix=".txt")
+        frame_files_sorted = sorted(frame_files)
+
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for frame_file in frame_files_sorted:
+                f.write(f"file '{os.path.abspath(frame_file)}'\n")
+
+        # 使用ffmpeg从图像序列生成视频
+        temp_video_path = output_path.replace('.mp4', '_temp.mp4')
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-r', str(fps),
+            '-i', list_file,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-loglevel', 'quiet',
+            temp_video_path
+        ]
+
+        try:
+            convert_start = time.time()
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            convert_time = time.time() - convert_start
+
+            if not os.path.exists(temp_video_path):
+                self.log("错误: ffmpeg未能生成视频")
+                os.remove(list_file)
+                return False
+
+            # 如果有音频，合并音频
+            if audio_path and os.path.exists(audio_path):
+                merge_cmd = [
+                    'ffmpeg', '-y',
+                    '-i', temp_video_path,
+                    '-i', audio_path,
+                    '-c:v', 'copy',
+                    '-c:a', 'aac',
+                    '-b:a', '192k',
+                    '-loglevel', 'quiet',
+                    output_path
+                ]
+
+                merge_start = time.time()
+                subprocess.run(merge_cmd, check=True, capture_output=True, text=True)
+                merge_time = time.time() - merge_start
+
+                os.remove(temp_video_path)
+                total_time = time.time() - start_time
+                self.log(
+                    f"视频生成成功，总耗时: {total_time:.2f}秒 (转换: {convert_time:.2f}s, 合并: {merge_time:.2f}s)")
+            else:
+                shutil.move(temp_video_path, output_path)
+                total_time = time.time() - start_time
+                self.log(f"视频生成成功，总耗时: {total_time:.2f}秒 (转换: {convert_time:.2f}s)")
+
+            os.remove(list_file)
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self.log(f"ffmpeg生成视频失败: {e.stderr}")
+            if os.path.exists(list_file):
+                os.remove(list_file)
+            return False
 
     def process_segment_directly(self, segment_path, segment_index):
         """直接处理视频片段（不进行重复帧检测）"""

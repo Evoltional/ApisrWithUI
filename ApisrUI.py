@@ -93,6 +93,7 @@ class APISRVideoProcessor:
         self.history_size_var = tk.StringVar(value="5")
         self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
         self.video_encoder_mode = tk.StringVar(value="auto")  # 新增：视频编码器模式
+        self.delete_temp_files_var = tk.BooleanVar(value=False)  # 新增：删除临时文件选项
         self.last_test_mode_state = False  # 记录上一次的测试模式状态
 
         # 设置样式
@@ -466,6 +467,7 @@ class APISRVideoProcessor:
             self.immediate_merge_var,
             self.test_mode_var,
             self.enable_history_var,
+            self.delete_temp_files_var,  # 新增：删除临时文件选项
         ]
 
         for var in boolean_vars:
@@ -658,18 +660,20 @@ class APISRVideoProcessor:
         ttk.Checkbutton(options_frame, text="立即合成视频",
                         variable=self.immediate_merge_var).pack(anchor=tk.W, pady=2)
 
+        # 新增：处理完成后删除临时文件选项
+        ttk.Checkbutton(options_frame, text="处理完成后删除临时文件",
+                        variable=self.delete_temp_files_var).pack(anchor=tk.W, pady=2)
+
         # 说明信息部分
         info_frame = ttk.LabelFrame(bottom_frame, text="说明", padding=8)
         info_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
 
         info_text = """1. 支持批量处理多个视频
-2. 暂停时可保存进度
-3. 重复帧检测可加速处理
-4. 历史帧数量可配置
+2. 哈希阈值越小，SSIM阈值越大，重复检测越严格
+3. 取消重复帧识别会切换直接处理视频模式，无法暂停
+4. 可利用测试模式自行调整参数
 5. 配置自动保存
-6. 测试模式有确认窗口
-7. 可立即合成视频
-8. 多种视频编码器支持"""
+6. 进度根据临时文件读取，请不要挪动临时文件"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -959,6 +963,8 @@ class APISRVideoProcessor:
                     self.immediate_merge_var.set(config['immediate_merge'])
                 if 'video_encoder_mode' in config:  # 新增：视频编码器模式
                     self.video_encoder_mode.set(config['video_encoder_mode'])
+                if 'delete_temp_files' in config:  # 新增：删除临时文件选项
+                    self.delete_temp_files_var.set(config['delete_temp_files'])
 
                 self.log(f"已从 {self.config_file} 加载配置")
 
@@ -993,6 +999,7 @@ class APISRVideoProcessor:
                 'history_size': int(self.history_size_var.get()),
                 'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
                 'video_encoder_mode': self.video_encoder_mode.get(),  # 保存视频编码器模式
+                'delete_temp_files': self.delete_temp_files_var.get(),  # 新增：保存删除临时文件选项
                 'last_saved': datetime.now().strftime("%Y-%m-d %H:%M:%S")
             }
 
@@ -2751,6 +2758,24 @@ class APISRVideoProcessor:
             if os.path.exists(list_file):
                 os.remove(list_file)
 
+    def delete_temp_dirs_if_enabled(self):
+        """如果启用了删除临时文件选项，则删除临时目录"""
+        if self.delete_temp_files_var.get() and not self.test_mode_var.get() and self.temp_base_dir:
+            temp_dir = self.temp_base_dir
+
+            # 确保不是空目录
+            if os.path.exists(temp_dir) and os.path.isdir(temp_dir):
+                try:
+                    # 检查目录是否包含临时文件（不只是空目录）
+                    if any(os.path.isfile(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir)):
+                        self.log(f"正在删除临时目录: {os.path.basename(temp_dir)}")
+                        shutil.rmtree(temp_dir)
+                        self.log(f"临时目录已删除: {os.path.basename(temp_dir)}")
+                    else:
+                        self.log(f"临时目录为空，跳过删除: {os.path.basename(temp_dir)}")
+                except Exception as e:
+                    self.log(f"删除临时目录时出错: {e}")
+
     def process_single_video(self, video_path):
         """处理单个视频"""
         try:
@@ -3038,6 +3063,13 @@ class APISRVideoProcessor:
             self.log("=" * 60)
             self.log("步骤5: 清理临时文件...")
             self.update_progress(100)
+
+            # 检查是否启用了删除临时文件选项
+            if self.delete_temp_files_var.get() and not self.test_mode_var.get():
+                self.log("用户选择处理完成后删除临时文件")
+                self.delete_temp_dirs_if_enabled()
+            else:
+                self.log("保留临时文件以供调试或恢复")
 
             # 视频处理完成统计
             total_video_time = time.time() - video_start_time

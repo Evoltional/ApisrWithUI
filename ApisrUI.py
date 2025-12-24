@@ -90,10 +90,9 @@ class APISRVideoProcessor:
         self.use_hash_var = tk.BooleanVar(value=True)
         self.test_mode_var = tk.BooleanVar(value=False)
         self.enable_history_var = tk.BooleanVar(value=True)
-        self.history_size_var = tk.StringVar(value="5")
+        self.history_size_var = tk.StringVar(value="20")  # 默认值改为20
         self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
         self.video_encoder_mode = tk.StringVar(value="auto")  # 新增：视频编码器模式
-        self.delete_temp_files_var = tk.BooleanVar(value=False)  # 新增：删除临时文件选项
         self.last_test_mode_state = False  # 记录上一次的测试模式状态
 
         # 设置样式
@@ -231,30 +230,62 @@ class APISRVideoProcessor:
                     self.log(f"清理测试临时目录时出错: {e}")
 
     def setup_history_size_validation(self):
-        """设置历史帧数量输入的验证"""
+        """设置历史帧数量输入的验证 - 修改：移除原来的trace验证，改为焦点离开时调整"""
 
-        def validate_history_size(*args):
-            # 获取当前值
+        # 创建验证函数，确保只能输入整数
+        def validate_integer_input(action, value_if_allowed):
+            if action == '1':  # 插入操作
+                if value_if_allowed == '':
+                    return True
+                try:
+                    int(value_if_allowed)
+                    return True
+                except ValueError:
+                    return False
+            return True
+
+        vcmd = (self.root.register(validate_integer_input), '%d', '%P')
+
+        # 在setup_ui中创建输入框时使用这个验证函数
+        self.history_validation_command = vcmd
+
+    def adjust_history_size(self, event=None):
+        """调整历史帧数量为最接近的10的倍数"""
+        try:
             current_value = self.history_size_var.get()
 
-            if not current_value.isdigit():
+            # 如果为空，设置为默认值20
+            if not current_value:
                 self.history_size_var.set("20")
                 return
 
             # 转换为整数
-            try:
-                history_size = int(current_value)
+            history_size = int(current_value)
 
-                # 限制范围在1-200之间（减少内存占用）
-                if history_size < 1:
-                    self.history_size_var.set("1")
-                elif history_size > 200:
-                    self.history_size_var.set("200")
-            except ValueError:
-                self.history_size_var.set("20")
+            # 限制范围在1-200之间
+            if history_size < 1:
+                history_size = 10  # 最小值设为10
+            elif history_size > 200:
+                history_size = 200
 
-        # 添加trace监听变量变化
-        self.history_size_var.trace('w', lambda *args: validate_history_size())
+            # 调整为最接近的10的倍数
+            history_size = round(history_size / 10) * 10
+
+            # 确保调整后仍在有效范围内
+            if history_size < 10:
+                history_size = 10
+            elif history_size > 200:
+                history_size = 200
+
+            # 更新变量
+            new_value = str(history_size)
+            if new_value != current_value:
+                self.history_size_var.set(new_value)
+                self.log(f"历史帧数量已调整为: {new_value} (最接近的10的倍数)")
+
+        except ValueError:
+            # 如果转换失败，设为默认值20
+            self.history_size_var.set("20")
 
     def setup_styles(self):
         """设置UI样式"""
@@ -281,9 +312,9 @@ class APISRVideoProcessor:
                 history_size = int(self.history_size_var.get())
                 # 确保历史帧数量在有效范围内
                 if history_size < 1:
-                    history_size = 1
-                    self.history_size_var.set("1")
-                elif history_size > 200:  # 限制最大历史帧数，防止内存占用过大
+                    history_size = 10
+                    self.history_size_var.set("10")
+                elif history_size > 200:  # 上限改为200
                     history_size = 200
                     self.history_size_var.set("200")
             except:
@@ -467,7 +498,6 @@ class APISRVideoProcessor:
             self.immediate_merge_var,
             self.test_mode_var,
             self.enable_history_var,
-            self.delete_temp_files_var,  # 新增：删除临时文件选项
         ]
 
         for var in boolean_vars:
@@ -618,28 +648,17 @@ class APISRVideoProcessor:
 
         ttk.Label(history_size_frame, text="数量:").pack(side=tk.LEFT, padx=(0, 5))
 
-        # 创建验证函数，确保只能输入整数
-        def validate_integer_input(action, value_if_allowed):
-            if action == '1':  # 插入操作
-                if value_if_allowed == '':
-                    return True
-                try:
-                    int(value_if_allowed)
-                    return True
-                except ValueError:
-                    return False
-            return True
-
-        # 创建历史帧数量输入框
-        vcmd = (self.root.register(validate_integer_input), '%d', '%P')
+        # 创建历史帧数量输入框 - 修改：使用验证命令并绑定焦点离开事件
         self.history_entry = ttk.Entry(history_size_frame, textvariable=self.history_size_var,
                                        width=6, font=('Segoe UI', 9),
-                                       validate='key', validatecommand=vcmd,
+                                       validate='key', validatecommand=self.history_validation_command,
                                        state='normal' if self.enable_history_var.get() else 'disabled')
         self.history_entry.pack(side=tk.LEFT, padx=(0, 5))
 
-        ttk.Label(history_size_frame, text="(1-20)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(
-            side=tk.LEFT)  # 修改为1-20
+        # 绑定焦点离开事件
+        self.history_entry.bind('<FocusOut>', self.adjust_history_size)
+
+        ttk.Label(history_size_frame, text="(1-200)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
         row += 1
 
@@ -660,10 +679,6 @@ class APISRVideoProcessor:
         ttk.Checkbutton(options_frame, text="立即合成视频",
                         variable=self.immediate_merge_var).pack(anchor=tk.W, pady=2)
 
-        # 新增：处理完成后删除临时文件选项
-        ttk.Checkbutton(options_frame, text="处理完成后删除临时文件",
-                        variable=self.delete_temp_files_var).pack(anchor=tk.W, pady=2)
-
         # 说明信息部分
         info_frame = ttk.LabelFrame(bottom_frame, text="说明", padding=8)
         info_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=0)
@@ -673,7 +688,9 @@ class APISRVideoProcessor:
 3. 取消重复帧识别会切换直接处理视频模式，无法暂停
 4. 可利用测试模式自行调整参数
 5. 配置自动保存
-6. 进度根据临时文件读取，请不要挪动临时文件"""
+6. 进度根据临时文件读取，请不要挪动临时文件
+7. 所有视频片段处理完后都会立即合成视频
+8. 开启立即合成功能会在每个片段完成后合并到整体视频"""
 
         info_label = tk.Label(info_frame, text=info_text,
                               font=('Segoe UI', 8),
@@ -700,6 +717,7 @@ class APISRVideoProcessor:
             self.log("历史帧功能已启用")
         else:
             self.history_entry.config(state='disabled')
+            self.log("历史帧功能已禁用")
 
     def get_gpu_info(self):
         """获取GPU信息"""
@@ -792,15 +810,14 @@ class APISRVideoProcessor:
         temp_dir_name = f"{video_name}{temp_dir_suffix}"
         self.temp_base_dir = os.path.join(output_dir, temp_dir_name)
 
-        # 创建标准化的目录结构
+        # 创建标准化的目录结构 - 删除05_logs相关
         dirs = {
             'base': self.temp_base_dir,
             'original_segments': os.path.join(self.temp_base_dir, "01_original_segments"),
             'audio': os.path.join(self.temp_base_dir, "02_audio"),
             'segment_frames': os.path.join(self.temp_base_dir, "03_segment_frames"),  # 直接放置before/after文件夹
             'processed_segments': os.path.join(self.temp_base_dir, "04_processed_segments"),
-            'logs': os.path.join(self.temp_base_dir, "05_logs"),
-            'immediate_merge': os.path.join(self.temp_base_dir, "06_immediate_merge")  # 新增：立即合成目录
+            'immediate_merge': os.path.join(self.temp_base_dir, "05_immediate_merge")  # 新增：立即合成目录
         }
 
         # 创建目录
@@ -809,28 +826,34 @@ class APISRVideoProcessor:
 
         return dirs
 
-    def setup_segment_frame_dirs(self, segment_index):
-        """为当前片段设置帧目录 - 直接在03_segment_frames下创建文件夹"""
+    def setup_segment_frame_dirs(self, segment_path):
+        """为当前片段设置帧目录 - 根据01_original_segments里的文件名来命名"""
         if not self.temp_base_dir:
             return None, None
 
+        # 从segment_path中获取文件名（不带扩展名）
+        segment_name = Path(segment_path).stem  # 例如：segment_000
+
         # 直接在03_segment_frames下创建带前后缀的文件夹
-        before_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_before")
-        after_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_after")
+        before_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"{segment_name}_before")
+        after_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"{segment_name}_after")
 
         os.makedirs(before_dir, exist_ok=True)
         os.makedirs(after_dir, exist_ok=True)
 
         return before_dir, after_dir
 
-    def cleanup_segment_frame_dirs(self, segment_index):
+    def cleanup_segment_frame_dirs(self, segment_path):
         """清理当前片段的帧目录"""
         if not self.temp_base_dir:
             return
 
+        # 从segment_path中获取文件名（不带扩展名）
+        segment_name = Path(segment_path).stem
+
         # 清理before和after文件夹
-        before_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_before")
-        after_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"segment_{segment_index:03d}_after")
+        before_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"{segment_name}_before")
+        after_dir = os.path.join(self.temp_base_dir, "03_segment_frames", f"{segment_name}_after")
 
         for dir_path in [before_dir, after_dir]:
             if os.path.exists(dir_path):
@@ -963,8 +986,6 @@ class APISRVideoProcessor:
                     self.immediate_merge_var.set(config['immediate_merge'])
                 if 'video_encoder_mode' in config:  # 新增：视频编码器模式
                     self.video_encoder_mode.set(config['video_encoder_mode'])
-                if 'delete_temp_files' in config:  # 新增：删除临时文件选项
-                    self.delete_temp_files_var.set(config['delete_temp_files'])
 
                 self.log(f"已从 {self.config_file} 加载配置")
 
@@ -999,15 +1020,12 @@ class APISRVideoProcessor:
                 'history_size': int(self.history_size_var.get()),
                 'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
                 'video_encoder_mode': self.video_encoder_mode.get(),  # 保存视频编码器模式
-                'delete_temp_files': self.delete_temp_files_var.get(),  # 新增：保存删除临时文件选项
                 'last_saved': datetime.now().strftime("%Y-%m-d %H:%M:%S")
             }
 
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)
 
-            # 只在调试时显示保存日志，避免频繁输出
-            # self.log(f"配置已自动保存到 {self.config_file}")
         except Exception as e:
             self.log(f"保存配置文件时出错: {e}")
 
@@ -1883,9 +1901,15 @@ class APISRVideoProcessor:
                 latest_after_dir = after_dirs[-1]
                 dir_name = os.path.basename(latest_after_dir)
 
-                # 提取片段编号，如segment_001_after -> 1
+                # 提取片段名称，如segment_000_after -> segment_000
                 try:
-                    current_segment = int(dir_name.split('_')[1])
+                    current_segment_name = dir_name.replace("_after", "")
+                    # 从segment_000获取数字部分
+                    if current_segment_name.startswith("segment_"):
+                        try:
+                            current_segment = int(current_segment_name.split('_')[1])
+                        except:
+                            current_segment = 0
                 except:
                     current_segment = 0
 
@@ -1917,13 +1941,15 @@ class APISRVideoProcessor:
         return next_segment, current_frame, processed_segments
 
     def process_segment_frames(self, segment_path, segment_index):
-        """处理视频片段的所有帧（逐帧处理）- 修改：停止后保留临时文件"""
+        """处理视频片段的所有帧（逐帧处理）- 修复：始终生成视频片段并删除临时帧文件"""
         segment_name = os.path.basename(segment_path)
         self.log(f"处理片段 {segment_index}: {segment_name}")
         segment_start_time = time.time()
 
         if self.test_mode_var.get():
             self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
+            # 测试模式不生成视频，但会保留帧文件供检查
+            return None, None
 
         # 初始化历史帧缓存
         self.init_history_cache()
@@ -1933,7 +1959,7 @@ class APISRVideoProcessor:
 
         # 为当前片段创建帧目录（直接创建在03_segment_frames下）
         setup_start = time.time()
-        before_dir, after_dir = self.setup_segment_frame_dirs(segment_index)
+        before_dir, after_dir = self.setup_segment_frame_dirs(segment_path)
         setup_time = time.time() - setup_start
 
         if not before_dir or not after_dir:
@@ -2009,20 +2035,7 @@ class APISRVideoProcessor:
         frame_idx = start_frame
         frame_files = []
 
-        # 创建重复帧记录文件
-        dup_record_path = os.path.join(self.temp_base_dir, "05_logs", f"segment_{segment_index:03d}_duplicates.txt")
-        with open(dup_record_path, 'w', encoding='utf-8') as dup_file:
-            dup_file.write(f"片段 {segment_index} 重复帧记录\n")
-            dup_file.write(f"哈希阈值: {self.hash_threshold_var.get()}\n")
-            dup_file.write(f"SSIM阈值: {self.ssim_threshold_var.get()}\n")
-            dup_file.write(f"哈希检测: {'启用' if self.use_hash_var.get() else '禁用'}\n")
-            dup_file.write(f"SSIM检测: {'启用' if self.use_ssim_var.get() else '禁用'}\n")
-            dup_file.write(f"历史帧功能: {'启用' if self.enable_history_var.get() else '禁用'}\n")
-            if self.enable_history_var.get():
-                history_size = int(self.history_size_var.get())
-                dup_file.write(f"历史帧数量: {history_size}\n")
-            dup_file.write("=" * 50 + "\n")
-            dup_file.write("帧号\t是否重复\t匹配帧号\t匹配原因\n")
+        # 注意：已删除重复帧记录文件的创建
 
         # 初始化帧计数器
         frames_processed = 0
@@ -2034,15 +2047,7 @@ class APISRVideoProcessor:
         total_sr_time = 0
         total_io_time = 0
 
-        # 检查片段是否已经完全处理完
-        segment_completed = False
-        if os.path.exists(after_dir):
-            after_files = [f for f in os.listdir(after_dir) if f.startswith("frame_") and f.endswith(".png")]
-            if len(after_files) >= total_frames:
-                self.log(f"片段 {segment_index} 已经完成处理，跳过")
-                segment_completed = True
-
-        while not segment_completed:
+        while True:
             # 检查是否被停止
             if self.stopped:
                 self.log(f"停止处理：片段 {segment_index} 的第 {frame_idx + 1} 帧")
@@ -2053,8 +2058,8 @@ class APISRVideoProcessor:
             if self.paused:
                 self.log(f"处理暂停于片段 {segment_index} 的第 {frame_idx + 1} 帧")
 
-                # 释放GPU内存以降低占用 - 修改：将模型从GPU移出
-                if not self.test_mode_var.get() and self.generator is not None:
+                # 释放GPU内存以降低占用
+                if self.generator is not None:
                     try:
                         # 将模型移动到CPU并释放GPU内存
                         self.generator = self.generator.cpu()
@@ -2070,13 +2075,10 @@ class APISRVideoProcessor:
 
                 while self.paused and not self.stopped:
                     time.sleep(0.5)  # 使用较短的休眠时间以便快速响应
-                    if self.paused:
-                        # 定期检查是否需要恢复
-                        pass
 
                 # 恢复处理
                 if not self.stopped:
-                    if not self.test_mode_var.get() and self.generator is not None:
+                    if self.generator is not None:
                         try:
                             # 将模型移回GPU
                             self.generator = self.generator.cuda()
@@ -2092,7 +2094,7 @@ class APISRVideoProcessor:
                     break
 
             # 每处理50帧清理一次内存
-            if frame_idx % 50 == 0 and not self.test_mode_var.get():
+            if frame_idx % 50 == 0:
                 self.cleanup_memory()
                 self.log(f"已清理内存（处理到第 {frame_idx} 帧）")
 
@@ -2141,16 +2143,9 @@ class APISRVideoProcessor:
             total_io_time += save_sr_time
 
             # 添加到帧文件列表
-            if not self.test_mode_var.get():
-                frame_files.append(after_path)
+            frame_files.append(after_path)
 
-            # 记录重复帧信息
-            with open(dup_record_path, 'a', encoding='utf-8') as dup_file:
-                if is_duplicate:
-                    matched_idx = self.frame_idx_history[0] if self.frame_idx_history else "未知"
-                    dup_file.write(f"{frame_idx}\t是\t{matched_idx}\t重复帧，使用历史结果\n")
-                else:
-                    dup_file.write(f"{frame_idx}\t否\t-\t正常处理\n")
+            # 注意：已删除重复帧记录文件的写入
 
             # 更新当前帧
             self.current_frame_in_segment = frame_idx + 1
@@ -2194,7 +2189,7 @@ class APISRVideoProcessor:
         self.clear_history_cache()
 
         # 只有在片段完全处理完且没有停止时才生成视频
-        if not self.stopped and frame_idx >= total_frames and not self.test_mode_var.get() and frame_files:
+        if not self.stopped and frame_idx >= total_frames and frame_files:
             # 生成处理后的片段视频
             processed_segment_path = os.path.join(self.temp_base_dir, "04_processed_segments",
                                                   f"processed_{segment_name}")
@@ -2208,6 +2203,11 @@ class APISRVideoProcessor:
             if success:
                 self.log(f"片段视频编码耗时: {encode_time:.2f}秒")
                 self.log(f"片段视频生成成功: {processed_segment_path}")
+
+                # 清理当前片段的帧目录
+                self.cleanup_segment_frame_dirs(segment_path)
+                self.log(f"已清理片段 {segment_name} 的帧临时文件 (before和after目录)")
+
                 return processed_segment_path, audio_path
             else:
                 self.log("片段视频生成失败")
@@ -2215,8 +2215,6 @@ class APISRVideoProcessor:
         else:
             if self.stopped:
                 self.log("处理被停止，不生成视频片段，保留临时文件以便下次继续处理")
-            elif self.test_mode_var.get():
-                self.log("测试模式：不生成视频片段")
             elif not frame_files:
                 self.log("没有帧文件可处理")
             return None, None
@@ -2700,7 +2698,7 @@ class APISRVideoProcessor:
         start_time = time.time()
 
         # 检查是否已经有合并的视频
-        merge_dir = os.path.join(self.temp_base_dir, "06_immediate_merge")
+        merge_dir = os.path.join(self.temp_base_dir, "05_immediate_merge")
         merged_video_path = os.path.join(merge_dir, f"merged_up_to_{segment_index:03d}.mp4")
 
         # 如果是第一个片段，直接复制
@@ -2757,24 +2755,6 @@ class APISRVideoProcessor:
         finally:
             if os.path.exists(list_file):
                 os.remove(list_file)
-
-    def delete_temp_dirs_if_enabled(self):
-        """如果启用了删除临时文件选项，则删除临时目录"""
-        if self.delete_temp_files_var.get() and not self.test_mode_var.get() and self.temp_base_dir:
-            temp_dir = self.temp_base_dir
-
-            # 确保不是空目录
-            if os.path.exists(temp_dir) and os.path.isdir(temp_dir):
-                try:
-                    # 检查目录是否包含临时文件（不只是空目录）
-                    if any(os.path.isfile(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir)):
-                        self.log(f"正在删除临时目录: {os.path.basename(temp_dir)}")
-                        shutil.rmtree(temp_dir)
-                        self.log(f"临时目录已删除: {os.path.basename(temp_dir)}")
-                    else:
-                        self.log(f"临时目录为空，跳过删除: {os.path.basename(temp_dir)}")
-                except Exception as e:
-                    self.log(f"删除临时目录时出错: {e}")
 
     def process_single_video(self, video_path):
         """处理单个视频"""
@@ -2955,14 +2935,15 @@ class APISRVideoProcessor:
                 if self.stopped:
                     break
 
-                if not self.test_mode_var.get() and processed_segment_path:
+                if processed_segment_path:
+                    # 所有非测试模式都会生成视频片段
+                    all_processed_segments.append(processed_segment_path)
+
                     # 如果启用了立即合并，进行合并
-                    if self.immediate_merge_var.get():
+                    if self.immediate_merge_var.get() and not self.test_mode_var.get():
                         merged_video = self.immediate_merge_segment(processed_segment_path, i)
                         if merged_video:
                             self.log(f"片段 {i + 1} 已立即合并到整体视频")
-
-                    all_processed_segments.append(processed_segment_path)
                 elif self.test_mode_var.get():
                     self.log(f"测试模式：片段 {i + 1} 处理完成，帧文件已保存")
 
@@ -2984,7 +2965,7 @@ class APISRVideoProcessor:
             # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
             if not self.test_mode_var.get():
                 # 检查是否有立即合成的最终视频
-                merge_dir = os.path.join(self.temp_base_dir, "06_immediate_merge")
+                merge_dir = os.path.join(self.temp_base_dir, "05_immediate_merge")
                 if self.immediate_merge_var.get() and os.path.exists(merge_dir):
                     # 查找最新的合并视频
                     merged_files = []
@@ -3056,20 +3037,28 @@ class APISRVideoProcessor:
                     else:
                         self.log("没有可拼接的片段")
             else:
+                # 测试模式：不生成视频
                 self.log("测试模式：跳过视频合成步骤")
                 self.update_progress(95)
 
-            # 步骤5: 清理临时文件
+            # 步骤5: 自动清理临时文件
             self.log("=" * 60)
-            self.log("步骤5: 清理临时文件...")
+            self.log("步骤5: 自动清理临时文件...")
             self.update_progress(100)
 
-            # 检查是否启用了删除临时文件选项
-            if self.delete_temp_files_var.get() and not self.test_mode_var.get():
-                self.log("用户选择处理完成后删除临时文件")
-                self.delete_temp_dirs_if_enabled()
+            # 在视频处理完成后，自动清理所有临时文件，只保留处理好的视频
+            if not self.test_mode_var.get():
+                # 检查是否成功生成了最终视频
+                output_filename = f"{self.video_base_name}_super_resolved.mp4"
+                final_output = os.path.join(self.output_dir.get(), output_filename)
+
+                if os.path.exists(final_output):
+                    # 清理除04_processed_segments和最终输出外的所有临时文件
+                    self.cleanup_temp_after_success(temp_dirs)
+                else:
+                    self.log("最终视频未生成，保留临时文件")
             else:
-                self.log("保留临时文件以供调试或恢复")
+                self.log("测试模式：保留临时文件供检查")
 
             # 视频处理完成统计
             total_video_time = time.time() - video_start_time
@@ -3119,7 +3108,6 @@ class APISRVideoProcessor:
 
             if self.test_mode_var.get():
                 self.log(f"测试模式完成！测试结果保存在: {temp_dirs['base']}")
-                # 测试模式下不删除临时文件，供用户查看结果
             else:
                 self.log(f"处理完成！输出文件: {self.video_base_name}_super_resolved.mp4")
 
@@ -3142,6 +3130,31 @@ class APISRVideoProcessor:
             import traceback
             self.log(f"错误详情:\n{traceback.format_exc()}")
             return False
+
+    def cleanup_temp_after_success(self, temp_dirs):
+        """成功处理后自动清理临时文件"""
+        try:
+            # 只保留04_processed_segments目录，清理其他临时目录
+            dirs_to_clean = [
+                temp_dirs['original_segments'],
+                temp_dirs['audio'],
+                temp_dirs['segment_frames'],
+                os.path.join(temp_dirs['base'], "06_immediate_merge")
+            ]
+
+            cleaned_count = 0
+            for dir_path in dirs_to_clean:
+                if os.path.exists(dir_path):
+                    try:
+                        shutil.rmtree(dir_path)
+                        cleaned_count += 1
+                        self.log(f"已清理临时目录: {os.path.basename(dir_path)}")
+                    except Exception as e:
+                        self.log(f"清理临时目录时出错({os.path.basename(dir_path)}): {e}")
+
+            self.log(f"自动清理完成，共清理 {cleaned_count} 个临时目录")
+        except Exception as e:
+            self.log(f"自动清理临时文件时出错: {e}")
 
     def concatenate_videos(self, video_list, output_path):
         """拼接视频片段"""
@@ -3354,9 +3367,9 @@ class APISRVideoProcessor:
                 self.batch_size_var.set("1")
                 return
 
-            if history_size < 1 or history_size > 20:
-                messagebox.showwarning("警告", "历史帧数量必须在1-20之间")
-                self.history_size_var.set("5")
+            if history_size < 1 or history_size > 200:
+                messagebox.showwarning("警告", "历史帧数量必须在1-200之间")
+                self.history_size_var.set("20")
                 return
         except ValueError:
             messagebox.showerror("错误", "参数格式错误")

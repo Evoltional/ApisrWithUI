@@ -593,7 +593,7 @@ class APISRVideoProcessor:
 
         # 4. 重复帧检测部分 - 占用一行两列
         dup_frame = ttk.LabelFrame(main_frame, text="重复帧检测设置", padding=8)
-        dup_frame.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=2, pady=2)
+        dup_frame.grid(row=row, column=0, columnspan=1, sticky="nsew", padx=2, pady=2)
 
         # 启用检测
         ttk.Checkbutton(dup_frame, text="启用重复帧检测",
@@ -1963,7 +1963,7 @@ class APISRVideoProcessor:
         return next_segment, current_frame, processed_segments
 
     def process_segment_frames(self, segment_path, segment_index):
-        """处理视频片段的所有帧（逐帧处理）- 修复：始终生成视频片段并删除临时帧文件"""
+        """处理视频片段的所有帧（逐帧处理）- 修复：添加帧位置恢复逻辑"""
         segment_name = os.path.basename(segment_path)
         self.log(f"处理片段 {segment_index}: {segment_name}")
         segment_start_time = time.time()
@@ -2034,25 +2034,18 @@ class APISRVideoProcessor:
         self.log(f"视频信息获取耗时: {cap_time:.2f}秒")
         self.log(f"输入尺寸: {width}x{height}, 输出尺寸: {output_width}x{output_height}")
 
-        # 显示检测参数
-        if self.enable_dup_detect_var.get():
-            methods = []
-            if self.use_hash_var.get():
-                methods.append(f"哈希(阈值:{self.hash_threshold_var.get()})")
-            if self.use_ssim_var.get():
-                methods.append(f"SSIM(阈值:{self.ssim_threshold_var.get()})")
-
-            if self.enable_history_var.get():
-                history_size = int(self.history_size_var.get())
-                self.log(f"重复帧检测: {', '.join(methods)}，历史帧: {history_size}")
-            else:
-                self.log(f"重复帧检测: {', '.join(methods)}，仅与前帧比较")
-
-        # 从进度检测中获取起始帧
+        # 从进度检测中获取起始帧 - 确保这是关键修复
         start_frame = self.current_frame_in_segment
         if start_frame > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            self.log(f"从第 {start_frame + 1} 帧恢复处理")
+            # 重要修复：设置视频帧位置
+            success = cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            if success:
+                self.log(f"从第 {start_frame + 1} 帧恢复处理（总帧数: {total_frames}）")
+            else:
+                self.log(f"警告：无法设置帧位置到 {start_frame}，将从第1帧开始")
+                start_frame = 0
+        else:
+            start_frame = 0
 
         frame_idx = start_frame
         frame_files = []
@@ -2068,6 +2061,29 @@ class APISRVideoProcessor:
         total_dup_detect_time = 0
         total_sr_time = 0
         total_io_time = 0
+
+        # 修复：检查after目录是否已有处理过的帧，避免重复处理
+        if os.path.exists(after_dir):
+            existing_frames = []
+            for f in os.listdir(after_dir):
+                if f.startswith("frame_") and f.endswith(".png"):
+                    try:
+                        frame_num = int(f.split('_')[1].split('.')[0])
+                        existing_frames.append(frame_num)
+                    except:
+                        pass
+
+            if existing_frames:
+                existing_frames.sort()
+                last_existing = existing_frames[-1]
+                if last_existing >= start_frame:
+                    # 跳过已存在的帧
+                    self.log(f"发现已处理的帧 {last_existing + 1}，从第 {last_existing + 1} 帧继续")
+                    frame_idx = last_existing
+                    if frame_idx > 0:
+                        success = cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        if success:
+                            self.log(f"跳过已存在的帧，从第 {frame_idx + 1} 帧开始")
 
         while True:
             # 检查是否被停止

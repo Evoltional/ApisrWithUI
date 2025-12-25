@@ -2208,6 +2208,10 @@ class APISRVideoProcessor:
                 self.cleanup_segment_frame_dirs(segment_path)
                 self.log(f"已清理片段 {segment_name} 的帧临时文件 (before和after目录)")
 
+                # 如果有立即合并功能，调用合并
+                if self.immediate_merge_var.get() and not self.test_mode_var.get():
+                    self.update_immediate_merge()
+
                 return processed_segment_path, audio_path
             else:
                 self.log("片段视频生成失败")
@@ -2688,42 +2692,115 @@ class APISRVideoProcessor:
         self.log(f"直接处理完成: {segment_name}，总耗时: {segment_elapsed:.2f}秒")
         self.log(f"  处理帧数: {frames_processed}，平均每帧耗时: {avg_frame_time:.3f}秒")
 
+        # 如果有立即合并功能，调用合并
+        if self.immediate_merge_var.get() and not self.test_mode_var.get():
+            self.update_immediate_merge()
+
         return processed_segment_path, audio_path if has_audio else None
 
-    def immediate_merge_segment(self, processed_segment_path, segment_index):
-        """立即合并当前处理好的片段到整体视频中"""
+    def update_immediate_merge(self):
+        """更新立即合并视频 - 检查04_processed_segments文件夹并合并到05_immediate_merge"""
         if not self.immediate_merge_var.get() or self.test_mode_var.get():
             return None
 
         start_time = time.time()
 
-        # 检查是否已经有合并的视频
+        # 获取路径
+        processed_segments_dir = os.path.join(self.temp_base_dir, "04_processed_segments")
         merge_dir = os.path.join(self.temp_base_dir, "05_immediate_merge")
-        merged_video_path = os.path.join(merge_dir, f"merged_up_to_{segment_index:03d}.mp4")
+        log_file_path = os.path.join(processed_segments_dir, "merge_log.txt")
 
-        # 如果是第一个片段，直接复制
-        if segment_index == 0 or not os.path.exists(
-                merged_video_path.replace(f"_{segment_index:03d}.mp4", f"_{segment_index - 1:03d}.mp4")):
-            shutil.copy2(processed_segment_path, merged_video_path)
-            elapsed = time.time() - start_time
-            self.log(f"立即合成: 创建初始合并视频 {segment_index:03d}，耗时: {elapsed:.2f}秒")
-            return merged_video_path
+        # 确保目录存在
+        os.makedirs(merge_dir, exist_ok=True)
 
-        # 获取上一个合并的视频
-        prev_merged_video = os.path.join(merge_dir, f"merged_up_to_{segment_index - 1:03d}.mp4")
+        # 读取日志文件，获取已合并的片段
+        merged_segments = set()
+        if os.path.exists(log_file_path):
+            try:
+                with open(log_file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        segment_name = line.strip()
+                        if segment_name:
+                            merged_segments.add(segment_name)
+                self.log(f"从日志文件中读取到 {len(merged_segments)} 个已合并的片段")
+            except Exception as e:
+                self.log(f"读取合并日志失败: {e}")
+                merged_segments = set()
 
-        if not os.path.exists(prev_merged_video):
-            self.log(f"立即合成: 找不到上一个合并视频，跳过")
+        # 获取04_processed_segments目录下所有的processed_segment_*.mp4文件
+        all_processed_segments = []
+        if os.path.exists(processed_segments_dir):
+            for f in sorted(os.listdir(processed_segments_dir)):
+                if f.startswith("processed_segment_") and f.endswith(".mp4"):
+                    all_processed_segments.append(f)
+
+        if not all_processed_segments:
+            self.log("没有找到已处理的片段")
             return None
 
-        # 合并当前片段到上一个合并视频
-        try:
-            # 创建临时文件列表
-            list_file = tempfile.mktemp(suffix=".txt")
+        # 找出未合并的片段
+        unmerged_segments = []
+        for segment in all_processed_segments:
+            if segment not in merged_segments:
+                unmerged_segments.append(segment)
 
+        if not unmerged_segments:
+            self.log("所有片段都已合并，无需操作")
+            return None
+
+        self.log(f"找到 {len(unmerged_segments)} 个未合并的片段")
+
+        # 获取当前的合并视频（如果有）
+        merged_videos = []
+        if os.path.exists(merge_dir):
+            for f in os.listdir(merge_dir):
+                if f.startswith("merged_video") and f.endswith(".mp4"):
+                    merged_videos.append(os.path.join(merge_dir, f))
+
+        merged_video_path = None
+        if merged_videos:
+            # 按修改时间排序，取最新的
+            merged_videos.sort(key=lambda x: os.path.getmtime(x))
+            merged_video_path = merged_videos[-1]
+            self.log(f"找到现有的合并视频: {os.path.basename(merged_video_path)}")
+        else:
+            self.log("没有找到现有的合并视频，将创建新的")
+
+        # 构建要合并的视频文件列表
+        video_files_to_merge = []
+
+        # 如果有现有的合并视频，先加入
+        if merged_video_path and os.path.exists(merged_video_path):
+            video_files_to_merge.append(merged_video_path)
+
+        # 加入新的未合并片段
+        for segment in unmerged_segments:
+            segment_path = os.path.join(processed_segments_dir, segment)
+            if os.path.exists(segment_path):
+                video_files_to_merge.append(segment_path)
+            else:
+                self.log(f"警告：片段文件不存在: {segment}")
+
+        if len(video_files_to_merge) == 0:
+            self.log("没有视频文件可合并")
+            return None
+
+        # 如果只有一个文件且是新的合并视频，直接复制
+        if len(video_files_to_merge) == 1 and video_files_to_merge[0] == merged_video_path:
+            self.log("只有现有的合并视频，无需操作")
+            return merged_video_path
+
+        # 创建临时文件列表
+        list_file = tempfile.mktemp(suffix=".txt")
+
+        try:
             with open(list_file, 'w', encoding='utf-8') as f:
-                f.write(f"file '{os.path.abspath(prev_merged_video)}'\n")
-                f.write(f"file '{os.path.abspath(processed_segment_path)}'\n")
+                for video_file in video_files_to_merge:
+                    f.write(f"file '{os.path.abspath(video_file)}'\n")
+
+            # 生成新的合并视频文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            new_merged_video_path = os.path.join(merge_dir, f"merged_video_{timestamp}.mp4")
 
             # 使用ffmpeg合并
             cmd = [
@@ -2732,22 +2809,35 @@ class APISRVideoProcessor:
                 '-safe', '0',
                 '-i', list_file,
                 '-c', 'copy',
-                merged_video_path
+                new_merged_video_path
             ]
 
             merge_start = time.time()
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             merge_time = time.time() - merge_start
 
+            # 更新日志文件，记录新合并的片段
+            try:
+                with open(log_file_path, 'a', encoding='utf-8') as f:
+                    for segment in unmerged_segments:
+                        f.write(f"{segment}\n")
+                self.log(f"已将 {len(unmerged_segments)} 个片段记录到合并日志")
+            except Exception as e:
+                self.log(f"写入合并日志失败: {e}")
+
+            # 删除旧的合并视频（如果有）
+            if merged_video_path and merged_video_path != new_merged_video_path:
+                try:
+                    os.remove(merged_video_path)
+                    self.log(f"已删除旧的合并视频: {os.path.basename(merged_video_path)}")
+                except Exception as e:
+                    self.log(f"删除旧的合并视频失败: {e}")
+
             elapsed = time.time() - start_time
-            self.log(
-                f"立即合成: 成功合并片段 {segment_index} 到整体视频，耗时: {elapsed:.2f}秒 (合并: {merge_time:.2f}s)")
+            self.log(f"立即合成成功: 合并了 {len(unmerged_segments)} 个新片段，耗时: {elapsed:.2f}秒 (合并: {merge_time:.2f}s)")
+            self.log(f"新的合并视频: {os.path.basename(new_merged_video_path)}")
 
-            # 删除上一个合并视频以节省空间
-            if os.path.exists(prev_merged_video):
-                os.remove(prev_merged_video)
-
-            return merged_video_path
+            return new_merged_video_path
 
         except Exception as e:
             self.log(f"立即合成失败: {e}")
@@ -2909,13 +2999,6 @@ class APISRVideoProcessor:
                     self.current_segment_index = i + 1
                     self.current_frame_in_segment = 0
                     all_processed_segments.append(processed_segment_path)
-
-                    # 如果启用了立即合并，进行合并
-                    if self.immediate_merge_var.get() and not self.test_mode_var.get():
-                        merged_video = self.immediate_merge_segment(processed_segment_path, i)
-                        if merged_video:
-                            self.log(f"片段 {i + 1} 已立即合并到整体视频")
-
                     continue
 
                 self.log(f"处理片段 {i + 1}/{len(self.segments)}: {segment_name}")
@@ -2938,12 +3021,6 @@ class APISRVideoProcessor:
                 if processed_segment_path:
                     # 所有非测试模式都会生成视频片段
                     all_processed_segments.append(processed_segment_path)
-
-                    # 如果启用了立即合并，进行合并
-                    if self.immediate_merge_var.get() and not self.test_mode_var.get():
-                        merged_video = self.immediate_merge_segment(processed_segment_path, i)
-                        if merged_video:
-                            self.log(f"片段 {i + 1} 已立即合并到整体视频")
                 elif self.test_mode_var.get():
                     self.log(f"测试模式：片段 {i + 1} 处理完成，帧文件已保存")
 
@@ -2970,12 +3047,12 @@ class APISRVideoProcessor:
                     # 查找最新的合并视频
                     merged_files = []
                     for f in os.listdir(merge_dir):
-                        if f.startswith("merged_up_to_") and f.endswith(".mp4"):
+                        if f.startswith("merged_video_") and f.endswith(".mp4"):
                             merged_files.append(os.path.join(merge_dir, f))
 
                     if merged_files:
-                        # 按数字排序
-                        merged_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                        # 按文件名排序（包含时间戳）
+                        merged_files.sort(key=lambda x: os.path.basename(x))
                         latest_merged = merged_files[-1]
 
                         # 将最终合并视频移动到输出目录
@@ -3139,7 +3216,7 @@ class APISRVideoProcessor:
                 temp_dirs['original_segments'],
                 temp_dirs['audio'],
                 temp_dirs['segment_frames'],
-                os.path.join(temp_dirs['base'], "06_immediate_merge")
+                os.path.join(temp_dirs['base'], "05_immediate_merge")
             ]
 
             cleaned_count = 0

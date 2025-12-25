@@ -81,8 +81,6 @@ class APISRVideoProcessor:
         self.downsample_threshold = tk.StringVar(value="720")
         self.float16_var = tk.BooleanVar(value=False)
         self.crop_for_4x_var = tk.BooleanVar(value=True)
-        self.batch_size_var = tk.StringVar(value="1")
-        self.tile_size_var = tk.StringVar(value="128")
         self.hash_threshold_var = tk.StringVar(value="3")
         self.ssim_threshold_var = tk.StringVar(value="0.98")
         self.enable_dup_detect_var = tk.BooleanVar(value=True)
@@ -477,8 +475,6 @@ class APISRVideoProcessor:
             (self.scale_var, 'w'),
             (self.segment_duration, 'w'),
             (self.downsample_threshold, 'w'),
-            (self.batch_size_var, 'w'),
-            (self.tile_size_var, 'w'),
             (self.hash_threshold_var, 'w'),
             (self.ssim_threshold_var, 'w'),
             (self.history_size_var, 'w'),
@@ -576,26 +572,22 @@ class APISRVideoProcessor:
         ttk.Entry(model_frame, textvariable=self.downsample_threshold,
                   width=12, font=('Segoe UI', 9)).grid(row=3, column=1, sticky=tk.W, pady=2)
 
-        # 3. 性能设置部分
+        # 3. 性能设置部分 - 修改：简化了内容
         perf_frame = ttk.LabelFrame(main_frame, text="性能设置", padding=8)
         perf_frame.grid(row=row, column=1, sticky="nsew", padx=2, pady=2)
 
-        ttk.Label(perf_frame, text="批处理大小:").grid(row=0, column=0, sticky=tk.W, pady=2, padx=(0, 5))
-        ttk.Entry(perf_frame, textvariable=self.batch_size_var,
-                  width=10, font=('Segoe UI', 9)).grid(row=0, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(perf_frame, text="瓦片大小:").grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 5))
-        ttk.Entry(perf_frame, textvariable=self.tile_size_var,
-                  width=10, font=('Segoe UI', 9)).grid(row=1, column=1, sticky=tk.W, pady=2)
-
-        ttk.Label(perf_frame, text="数据类型:").grid(row=2, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Label(perf_frame, text="数据类型:").grid(row=0, column=0, sticky=tk.W, pady=2, padx=(0, 5))
         ttk.Checkbutton(perf_frame, text="FP16加速",
-                        variable=self.float16_var).grid(row=2, column=1, sticky=tk.W, pady=2)
+                        variable=self.float16_var).grid(row=0, column=1, sticky=tk.W, pady=2)
 
-        ttk.Label(perf_frame, text="视频编码:").grid(row=3, column=0, sticky=tk.W, pady=2, padx=(0, 5))
+        ttk.Label(perf_frame, text="视频编码:").grid(row=1, column=0, sticky=tk.W, pady=2, padx=(0, 5))
         encoder_combo = ttk.Combobox(perf_frame, textvariable=self.video_encoder_mode,
                                      values=["auto", "opencv", "ffmpeg"], width=10, state="readonly")
-        encoder_combo.grid(row=3, column=1, sticky=tk.W, pady=2)
+        encoder_combo.grid(row=1, column=1, sticky=tk.W, pady=2)
+
+        # 添加两行空行以保持布局平衡
+        ttk.Label(perf_frame, text="").grid(row=2, column=0, pady=2)
+        ttk.Label(perf_frame, text="").grid(row=3, column=0, pady=2)
 
         row += 1
 
@@ -948,27 +940,38 @@ class APISRVideoProcessor:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
 
-                # 设置变量
+                # 安全的数值加载函数
+                def safe_get_int(key, default, config_dict):
+                    value = config_dict.get(key, default)
+                    try:
+                        return int(value)
+                    except (ValueError, TypeError):
+                        return default
+
+                def safe_get_float(key, default, config_dict):
+                    value = config_dict.get(key, default)
+                    try:
+                        return float(value)
+                    except (ValueError, TypeError):
+                        return default
+
+                # 设置变量，使用安全转换
                 if 'model' in config:
                     self.model_var.set(config['model'])
                 if 'scale' in config:
-                    self.scale_var.set(str(config['scale']))
+                    self.scale_var.set(str(safe_get_int('scale', 4, config)))
                 if 'segment_duration' in config:
-                    self.segment_duration.set(str(config['segment_duration']))
+                    self.segment_duration.set(str(safe_get_int('segment_duration', 20, config)))
                 if 'downsample_threshold' in config:
-                    self.downsample_threshold.set(str(config['downsample_threshold']))
+                    self.downsample_threshold.set(str(safe_get_int('downsample_threshold', 720, config)))
                 if 'float16' in config:
                     self.float16_var.set(config['float16'])
                 if 'crop_for_4x' in config:
                     self.crop_for_4x_var.set(config['crop_for_4x'])
-                if 'batch_size' in config:
-                    self.batch_size_var.set(str(config['batch_size']))
-                if 'tile_size' in config:
-                    self.tile_size_var.set(str(config['tile_size']))
                 if 'hash_threshold' in config:
-                    self.hash_threshold_var.set(str(config['hash_threshold']))
+                    self.hash_threshold_var.set(str(safe_get_int('hash_threshold', 3, config)))
                 if 'ssim_threshold' in config:
-                    self.ssim_threshold_var.set(str(config['ssim_threshold']))
+                    self.ssim_threshold_var.set(str(safe_get_float('ssim_threshold', 0.98, config)))
                 if 'enable_dup_detect' in config:
                     self.enable_dup_detect_var.set(config['enable_dup_detect'])
                 if 'use_ssim' in config:
@@ -977,14 +980,14 @@ class APISRVideoProcessor:
                     self.use_hash_var.set(config['use_hash'])
                 if 'test_mode' in config:
                     self.test_mode_var.set(config['test_mode'])
-                    self.last_test_mode_state = config['test_mode']  # 记录初始状态
+                    self.last_test_mode_state = config['test_mode']
                 if 'enable_history' in config:
                     self.enable_history_var.set(config['enable_history'])
                 if 'history_size' in config:
-                    self.history_size_var.set(str(config['history_size']))
+                    self.history_size_var.set(str(safe_get_int('history_size', 20, config)))
                 if 'immediate_merge' in config:
                     self.immediate_merge_var.set(config['immediate_merge'])
-                if 'video_encoder_mode' in config:  # 新增：视频编码器模式
+                if 'video_encoder_mode' in config:
                     self.video_encoder_mode.set(config['video_encoder_mode'])
 
                 self.log(f"已从 {self.config_file} 加载配置")
@@ -995,32 +998,48 @@ class APISRVideoProcessor:
 
             except Exception as e:
                 self.log(f"加载配置文件时出错: {e}")
+                import traceback
+                self.log(f"错误详情: {traceback.format_exc()}")
         else:
             self.log("未找到配置文件，使用默认配置")
 
     def save_config(self):
         """保存配置文件（永远自动保存）"""
         try:
+            # 使用默认值处理空字符串或无效输入
+            def get_int_value(var, default):
+                value = var.get()
+                try:
+                    return int(value) if value else default
+                except ValueError:
+                    return default
+
+            def get_float_value(var, default):
+                value = var.get()
+                try:
+                    return float(value) if value else default
+                except ValueError:
+                    return default
+
+            # 获取所有配置值，使用默认值处理空字符串
             config = {
                 'model': self.model_var.get(),
-                'scale': int(self.scale_var.get()),
-                'segment_duration': int(self.segment_duration.get()),
-                'downsample_threshold': int(self.downsample_threshold.get()),
+                'scale': get_int_value(self.scale_var, 4),
+                'segment_duration': get_int_value(self.segment_duration, 20),
+                'downsample_threshold': get_int_value(self.downsample_threshold, 720),
                 'float16': self.float16_var.get(),
                 'crop_for_4x': self.crop_for_4x_var.get(),
-                'batch_size': int(self.batch_size_var.get()),
-                'tile_size': int(self.tile_size_var.get()),
-                'hash_threshold': int(self.hash_threshold_var.get()),
-                'ssim_threshold': float(self.ssim_threshold_var.get()),
+                'hash_threshold': get_int_value(self.hash_threshold_var, 3),
+                'ssim_threshold': get_float_value(self.ssim_threshold_var, 0.98),
                 'enable_dup_detect': self.enable_dup_detect_var.get(),
                 'use_ssim': self.use_ssim_var.get(),
                 'use_hash': self.use_hash_var.get(),
                 'test_mode': self.test_mode_var.get(),
                 'enable_history': self.enable_history_var.get(),
-                'history_size': int(self.history_size_var.get()),
-                'immediate_merge': self.immediate_merge_var.get(),  # 保存立即合成选项
-                'video_encoder_mode': self.video_encoder_mode.get(),  # 保存视频编码器模式
-                'last_saved': datetime.now().strftime("%Y-%m-d %H:%M:%S")
+                'history_size': get_int_value(self.history_size_var, 20),
+                'immediate_merge': self.immediate_merge_var.get(),
+                'video_encoder_mode': self.video_encoder_mode.get(),
+                'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 修正了日期格式错误
             }
 
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -1028,6 +1047,9 @@ class APISRVideoProcessor:
 
         except Exception as e:
             self.log(f"保存配置文件时出错: {e}")
+            # 打印详细错误信息以帮助调试
+            import traceback
+            self.log(f"错误详情: {traceback.format_exc()}")
 
     # ============================================================
     # 内存监控和清理函数
@@ -3284,11 +3306,16 @@ class APISRVideoProcessor:
                 messagebox.showerror("错误", "请选择输出目录")
                 return
 
-            # 验证参数
+            # 验证参数（添加空值检查）
             try:
-                hash_threshold = int(self.hash_threshold_var.get())
-                ssim_threshold = float(self.ssim_threshold_var.get())
-                history_size = int(self.history_size_var.get())
+                hash_threshold_str = self.hash_threshold_var.get()
+                ssim_threshold_str = self.ssim_threshold_var.get()
+                history_size_str = self.history_size_var.get()
+
+                # 处理空值
+                hash_threshold = int(hash_threshold_str) if hash_threshold_str else 3
+                ssim_threshold = float(ssim_threshold_str) if ssim_threshold_str else 0.98
+                history_size = int(history_size_str) if history_size_str else 20
 
                 if hash_threshold < 0 or hash_threshold > 10:
                     messagebox.showwarning("警告", "哈希相似度阈值必须在0-10之间")
@@ -3427,7 +3454,6 @@ class APISRVideoProcessor:
         try:
             scale = int(self.scale_var.get())
             model = self.model_var.get()
-            batch_size = int(self.batch_size_var.get())
             history_size = int(self.history_size_var.get())
 
             if model in ["GRL", "DAT"] and scale != 4:
@@ -3437,11 +3463,6 @@ class APISRVideoProcessor:
 
             if scale not in [2, 4]:
                 messagebox.showwarning("警告", "缩放因子必须是2或4")
-                return
-
-            if batch_size < 1 or batch_size > 2:
-                messagebox.showwarning("警告", "6GB GPU批处理大小建议为1-2")
-                self.batch_size_var.set("1")
                 return
 
             if history_size < 1 or history_size > 200:

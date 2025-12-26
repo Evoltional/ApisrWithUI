@@ -92,6 +92,7 @@ class APISRVideoProcessor:
         self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
         self.video_encoder_mode = tk.StringVar(value="auto")  # 新增：视频编码器模式
         self.last_test_mode_state = False  # 记录上一次的测试模式状态
+        self.post_action_var = tk.StringVar(value="none")  # 新增：任务结束行为
 
         # 设置样式
         self.setup_styles()
@@ -479,6 +480,7 @@ class APISRVideoProcessor:
             (self.ssim_threshold_var, 'w'),
             (self.history_size_var, 'w'),
             (self.video_encoder_mode, 'w'),  # 新增：视频编码器模式
+            (self.post_action_var, 'w'),  # 新增：任务结束行为
         ]
 
         for var, mode in variables_to_trace:
@@ -591,7 +593,7 @@ class APISRVideoProcessor:
 
         row += 1
 
-        # 4. 重复帧检测部分 - 占用一行两列
+        # 4. 重复帧检测部分 - 占用一行第一列
         dup_frame = ttk.LabelFrame(main_frame, text="重复帧检测设置", padding=8)
         dup_frame.grid(row=row, column=0, columnspan=1, sticky="nsew", padx=2, pady=2)
 
@@ -651,6 +653,37 @@ class APISRVideoProcessor:
         self.history_entry.bind('<FocusOut>', self.adjust_history_size)
 
         ttk.Label(history_size_frame, text="(1-200)", foreground='#7f8c8d', font=('Segoe UI', 8)).pack(side=tk.LEFT)
+
+        # 4.1 任务结束行为部分 - 占用一行第二列
+        action_frame = ttk.LabelFrame(main_frame, text="任务结束行为", padding=8)
+        action_frame.grid(row=row, column=1, columnspan=1, sticky="nsew", padx=2, pady=2)
+
+        # 添加说明标签
+        info_label = tk.Label(action_frame, text="批量处理结束后自动执行:",
+                              font=('Segoe UI', 9),
+                              foreground='#7f8c8d',
+                              background=self.bg_color)
+        info_label.pack(anchor=tk.W, pady=(0, 5))
+
+        # 创建单选按钮
+        ttk.Radiobutton(action_frame, text="无行为",
+                        variable=self.post_action_var,
+                        value="none").pack(anchor=tk.W, pady=2)
+
+        ttk.Radiobutton(action_frame, text="关闭程序",
+                        variable=self.post_action_var,
+                        value="close").pack(anchor=tk.W, pady=2)
+
+        ttk.Radiobutton(action_frame, text="关机",
+                        variable=self.post_action_var,
+                        value="shutdown").pack(anchor=tk.W, pady=2)
+
+        # 添加警告标签
+        warning_label = tk.Label(action_frame, text="注意：选中关机将自动执行，无需确认",
+                                 font=('Segoe UI', 8),
+                                 foreground=self.warning_color,
+                                 background=self.bg_color)
+        warning_label.pack(anchor=tk.W, pady=(5, 0))
 
         row += 1
 
@@ -989,6 +1022,8 @@ class APISRVideoProcessor:
                     self.immediate_merge_var.set(config['immediate_merge'])
                 if 'video_encoder_mode' in config:
                     self.video_encoder_mode.set(config['video_encoder_mode'])
+                if 'post_action' in config:
+                    self.post_action_var.set(config['post_action'])
 
                 self.log(f"已从 {self.config_file} 加载配置")
 
@@ -1039,6 +1074,7 @@ class APISRVideoProcessor:
                 'history_size': get_int_value(self.history_size_var, 20),
                 'immediate_merge': self.immediate_merge_var.get(),
                 'video_encoder_mode': self.video_encoder_mode.get(),
+                'post_action': self.post_action_var.get(),
                 'last_saved': datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 修正了日期格式错误
             }
 
@@ -1050,10 +1086,6 @@ class APISRVideoProcessor:
             # 打印详细错误信息以帮助调试
             import traceback
             self.log(f"错误详情: {traceback.format_exc()}")
-
-    # ============================================================
-    # 内存监控和清理函数
-    # ============================================================
 
     def add_memory_monitoring(self):
         """添加内存使用监控功能"""
@@ -1107,9 +1139,40 @@ class APISRVideoProcessor:
         except Exception as e:
             self.log(f"内存清理时出错: {e}")
 
-    # ============================================================
-    # 模型加载函数（从test_utils.py整合）
-    # ============================================================
+    def execute_post_action(self):
+        """执行任务结束后的行为"""
+        action = self.post_action_var.get()
+
+        if action == "none":
+            self.log("任务结束行为: 无操作")
+            return
+        elif action == "close":
+            self.log("任务结束行为: 关闭程序")
+            # 延迟1秒后关闭程序，让日志有时间输出
+            self.root.after(1000, self.root.destroy)
+        elif action == "shutdown":
+            self.log("任务结束行为: 正在关机...")
+            # 根据操作系统执行关机命令
+            try:
+                if sys.platform == "win32":
+                    # Windows关机命令
+                    subprocess.run(["shutdown", "/s", "/t", "10"], shell=True)
+                    self.log("系统将在10秒后关机")
+                elif sys.platform == "darwin":
+                    # macOS关机命令
+                    subprocess.run(["sudo", "shutdown", "-h", "+1"])
+                    self.log("系统将在1分钟后关机")
+                else:
+                    # Linux关机命令
+                    subprocess.run(["sudo", "shutdown", "-h", "+1"])
+                    self.log("系统将在1分钟后关机")
+            except Exception as e:
+                self.log(f"执行关机命令时出错: {e}")
+            finally:
+                # 无论关机命令是否成功，都关闭程序
+                self.root.after(1000, self.root.destroy)
+        else:
+            self.log(f"未知的任务结束行为: {action}")
 
     def load_rrdb(self, generator_weight_PATH, scale, print_options=False):
         '''加载RRDB模型'''
@@ -1298,10 +1361,6 @@ class APISRVideoProcessor:
         self.log(f"DAT模型参数数量: {num_params / 10 ** 6: 0.2f}M")
 
         return generator
-
-    # ============================================================
-    # 重复帧检测函数
-    # ============================================================
 
     def calculate_frame_hash(self, frame):
         """计算帧的感知哈希值（优化版）"""
@@ -1575,10 +1634,6 @@ class APISRVideoProcessor:
 
         self.frame_sr_history.append(sr_result.copy() if sr_result is not None else None)
         self.frame_idx_history.append(frame_idx)
-
-    # ============================================================
-    # 视频处理函数
-    # ============================================================
 
     def extract_audio(self, video_path, audio_path):
         """提取音频"""
@@ -2828,31 +2883,108 @@ class APISRVideoProcessor:
             self.log("只有现有的合并视频，无需操作")
             return merged_video_path
 
-        # 创建临时文件列表
-        list_file = tempfile.mktemp(suffix=".txt")
-
         try:
-            with open(list_file, 'w', encoding='utf-8') as f:
-                for video_file in video_files_to_merge:
-                    f.write(f"file '{os.path.abspath(video_file)}'\n")
+            # 检查第一个视频的参数，用于设置输出参数
+            first_video_path = video_files_to_merge[0]
+
+            # 使用ffprobe获取视频信息
+            try:
+                probe_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height,r_frame_rate,codec_name,pix_fmt',
+                    '-of', 'json',
+                    first_video_path
+                ]
+
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                video_info = json.loads(probe_result.stdout)
+
+                if 'streams' in video_info and len(video_info['streams']) > 0:
+                    stream_info = video_info['streams'][0]
+                    width = stream_info.get('width', 1920)
+                    height = stream_info.get('height', 1080)
+                    r_frame_rate = stream_info.get('r_frame_rate', '30/1')
+
+                    # 计算帧率
+                    if '/' in r_frame_rate:
+                        num, den = r_frame_rate.split('/')
+                        fps = float(num) / float(den)
+                    else:
+                        fps = float(r_frame_rate)
+
+                    codec_name = stream_info.get('codec_name', 'h264')
+                    pix_fmt = stream_info.get('pix_fmt', 'yuv420p')
+
+                    self.log(f"视频参数: {width}x{height}, 帧率: {fps:.2f}, 编码: {codec_name}, 像素格式: {pix_fmt}")
+                else:
+                    width, height, fps = 1920, 1080, 30.0
+                    codec_name, pix_fmt = 'h264', 'yuv420p'
+                    self.log("无法获取视频参数，使用默认值")
+
+            except Exception as e:
+                self.log(f"获取视频信息失败: {e}")
+                width, height, fps = 1920, 1080, 30.0
+                codec_name, pix_fmt = 'h264', 'yuv420p'
 
             # 生成新的合并视频文件名
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             new_merged_video_path = os.path.join(merge_dir, f"merged_video_{timestamp}.mp4")
 
-            # 使用ffmpeg合并
+            # 创建临时文件列表
+            list_file = tempfile.mktemp(suffix=".txt")
+
+            with open(list_file, 'w', encoding='utf-8') as f:
+                for video_file in video_files_to_merge:
+                    f.write(f"file '{os.path.abspath(video_file)}'\n")
+
+            # 使用ffmpeg合并视频，并重新编码以确保编码参数一致
+            # 关键修改：不使用简单的copy，而是重新编码以确保一致性
             cmd = [
                 'ffmpeg', '-y',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', list_file,
-                '-c', 'copy',
+                '-c:v', 'libx264',  # 强制使用h264编码
+                '-preset', 'medium',  # 平衡编码速度和质量
+                '-crf', '18',  # 较高的质量（18是视觉无损）
+                '-r', str(fps),  # 设置帧率
+                '-pix_fmt', pix_fmt,  # 使用相同的像素格式
+                '-c:a', 'aac',  # 音频编码为aac
+                '-b:a', '192k',  # 音频比特率
+                '-strict', 'experimental',
+                '-loglevel', 'quiet',
                 new_merged_video_path
             ]
 
             merge_start = time.time()
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                self.log(f"重新编码合并失败，尝试使用流复制: {e.stderr}")
+                # 如果重新编码失败，尝试使用流复制
+                cmd_fallback = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', list_file,
+                    '-c', 'copy',
+                    '-loglevel', 'quiet',
+                    new_merged_video_path
+                ]
+                subprocess.run(cmd_fallback, check=True, capture_output=True, text=True)
+
             merge_time = time.time() - merge_start
+
+            # 检查生成的视频文件
+            if not os.path.exists(new_merged_video_path):
+                self.log("合并视频文件创建失败")
+                if os.path.exists(list_file):
+                    os.remove(list_file)
+                return None
+
+            file_size = os.path.getsize(new_merged_video_path) / (1024 * 1024)
+            self.log(f"合并视频创建成功，大小: {file_size:.2f} MB")
 
             # 更新日志文件，记录新合并的片段
             try:
@@ -2872,13 +3004,16 @@ class APISRVideoProcessor:
                     self.log(f"删除旧的合并视频失败: {e}")
 
             elapsed = time.time() - start_time
-            self.log(f"立即合成成功: 合并了 {len(unmerged_segments)} 个新片段，耗时: {elapsed:.2f}秒 (合并: {merge_time:.2f}s)")
+            self.log(
+                f"立即合成成功: 合并了 {len(unmerged_segments)} 个新片段，耗时: {elapsed:.2f}秒 (合并: {merge_time:.2f}s)")
             self.log(f"新的合并视频: {os.path.basename(new_merged_video_path)}")
 
             return new_merged_video_path
 
         except Exception as e:
             self.log(f"立即合成失败: {e}")
+            import traceback
+            self.log(f"错误详情: {traceback.format_exc()}")
             return None
         finally:
             if os.path.exists(list_file):
@@ -3098,15 +3233,20 @@ class APISRVideoProcessor:
                         final_output = os.path.join(self.output_dir.get(), output_filename)
 
                         merge_start = time.time()
-                        shutil.copy2(latest_merged, final_output)
-                        merge_time = time.time() - merge_start
+                        # 确保视频重新编码以确保兼容性
+                        if self.concatenate_videos_reencode([latest_merged], final_output):
+                            merge_time = time.time() - merge_start
 
-                        self.update_progress(95)
-                        self.log(f"使用立即合成的视频作为最终输出: {final_output}，复制耗时: {merge_time:.2f}秒")
+                            self.update_progress(95)
+                            self.log(f"使用立即合成的视频作为最终输出: {final_output}，编码耗时: {merge_time:.2f}秒")
 
-                        # 清理立即合成目录
-                        shutil.rmtree(merge_dir)
-                        self.log("已清理立即合成目录")
+                            # 清理立即合成目录
+                            shutil.rmtree(merge_dir)
+                            self.log("已清理立即合成目录")
+                        else:
+                            # 如果重新编码失败，使用简单复制
+                            shutil.copy2(latest_merged, final_output)
+                            self.log(f"使用立即合成的视频作为最终输出（简单复制）: {final_output}")
                     else:
                         # 如果没有立即合成视频，则使用传统拼接方式
                         self.log("=" * 60)
@@ -3117,7 +3257,7 @@ class APISRVideoProcessor:
                             final_output = os.path.join(self.output_dir.get(), output_filename)
 
                             if len(all_processed_segments) > 1:
-                                self.concatenate_videos(all_processed_segments, final_output)
+                                self.concatenate_videos_reencode(all_processed_segments, final_output)
                             else:
                                 # 如果只有一个片段，直接复制
                                 copy_start = time.time()
@@ -3139,7 +3279,7 @@ class APISRVideoProcessor:
                         final_output = os.path.join(self.output_dir.get(), output_filename)
 
                         if len(all_processed_segments) > 1:
-                            self.concatenate_videos(all_processed_segments, final_output)
+                            self.concatenate_videos_reencode(all_processed_segments, final_output)
                         else:
                             # 如果只有一个片段，直接复制
                             copy_start = time.time()
@@ -3271,9 +3411,197 @@ class APISRVideoProcessor:
         except Exception as e:
             self.log(f"自动清理临时文件时出错: {e}")
 
+    def concatenate_videos_reencode(self, video_list, output_path):
+        """重新编码拼接视频片段"""
+        self.log("开始重新编码拼接视频片段...")
+        start_time = time.time()
+
+        if not video_list:
+            self.log("错误: 没有可用的视频文件")
+            return False
+
+        # 如果只有一个视频，直接重新编码它以确保兼容性
+        if len(video_list) == 1:
+            single_video_path = video_list[0]
+
+            # 获取视频信息
+            try:
+                probe_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height,r_frame_rate,codec_name,pix_fmt',
+                    '-of', 'json',
+                    single_video_path
+                ]
+
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                video_info = json.loads(probe_result.stdout)
+
+                if 'streams' in video_info and len(video_info['streams']) > 0:
+                    stream_info = video_info['streams'][0]
+                    width = stream_info.get('width', 1920)
+                    height = stream_info.get('height', 1080)
+                    r_frame_rate = stream_info.get('r_frame_rate', '30/1')
+
+                    # 计算帧率
+                    if '/' in r_frame_rate:
+                        num, den = r_frame_rate.split('/')
+                        fps = float(num) / float(den)
+                    else:
+                        fps = float(r_frame_rate)
+
+                    pix_fmt = stream_info.get('pix_fmt', 'yuv420p')
+
+                    self.log(f"单个视频参数: {width}x{height}, 帧率: {fps:.2f}, 像素格式: {pix_fmt}")
+                else:
+                    width, height, fps = 1920, 1080, 30.0
+                    pix_fmt = 'yuv420p'
+                    self.log("无法获取视频参数，使用默认值")
+
+            except Exception as e:
+                self.log(f"获取视频信息失败: {e}")
+                width, height, fps = 1920, 1080, 30.0
+                pix_fmt = 'yuv420p'
+
+            # 重新编码单个视频
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', single_video_path,
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '18',
+                '-r', str(fps),
+                '-pix_fmt', pix_fmt,
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-strict', 'experimental',
+                '-loglevel', 'quiet',
+                output_path
+            ]
+
+            try:
+                encode_start = time.time()
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                encode_time = time.time() - encode_start
+
+                total_time = time.time() - start_time
+                self.log(f"单个视频重新编码完成: {output_path}")
+                self.log(f"  总耗时: {total_time:.2f}秒 (编码: {encode_time:.2f}s)")
+                return True
+            except subprocess.CalledProcessError as e:
+                self.log(f"单个视频重新编码失败: {e.stderr}")
+                # 回退到简单复制
+                try:
+                    shutil.copy2(single_video_path, output_path)
+                    self.log("使用简单复制作为回退方案")
+                    return True
+                except Exception as e2:
+                    self.log(f"简单复制也失败: {e2}")
+                    return False
+
+        # 多个视频拼接
+        # 创建临时文件列表
+        list_file = tempfile.mktemp(suffix=".txt")
+
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for video in video_list:
+                f.write(f"file '{os.path.abspath(video)}'\n")
+
+        # 获取第一个视频的参数
+        first_video_path = video_list[0]
+
+        try:
+            probe_cmd = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height,r_frame_rate,codec_name,pix_fmt',
+                '-of', 'json',
+                first_video_path
+            ]
+
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+            video_info = json.loads(probe_result.stdout)
+
+            if 'streams' in video_info and len(video_info['streams']) > 0:
+                stream_info = video_info['streams'][0]
+                width = stream_info.get('width', 1920)
+                height = stream_info.get('height', 1080)
+                r_frame_rate = stream_info.get('r_frame_rate', '30/1')
+
+                # 计算帧率
+                if '/' in r_frame_rate:
+                    num, den = r_frame_rate.split('/')
+                    fps = float(num) / float(den)
+                else:
+                    fps = float(r_frame_rate)
+
+                pix_fmt = stream_info.get('pix_fmt', 'yuv420p')
+
+                self.log(f"最终合成参数: {width}x{height}, 帧率: {fps:.2f}, 像素格式: {pix_fmt}")
+            else:
+                width, height, fps = 1920, 1080, 30.0
+                pix_fmt = 'yuv420p'
+                self.log("无法获取视频参数，使用默认值")
+
+        except Exception as e:
+            self.log(f"获取视频信息失败: {e}")
+            width, height, fps = 1920, 1080, 30.0
+            pix_fmt = 'yuv420p'
+
+        # 使用ffmpeg拼接并重新编码
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '18',
+            '-r', str(fps),
+            '-pix_fmt', pix_fmt,
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-strict', 'experimental',
+            '-loglevel', 'quiet',
+            output_path
+        ]
+
+        try:
+            concat_start = time.time()
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            concat_time = time.time() - concat_start
+
+            total_time = time.time() - start_time
+            self.log(f"视频重新编码拼接完成: {output_path}")
+            self.log(f"  总耗时: {total_time:.2f}秒 (拼接: {concat_time:.2f}s)")
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log(f"重新编码拼接失败: {e.stderr}")
+            # 回退到原始方法
+            self.log("尝试使用流复制方式...")
+            try:
+                cmd_fallback = [
+                    'ffmpeg', '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', list_file,
+                    '-c', 'copy',
+                    '-loglevel', 'quiet',
+                    output_path
+                ]
+                subprocess.run(cmd_fallback, check=True, capture_output=True, text=True)
+                self.log("流复制方式成功")
+                return True
+            except subprocess.CalledProcessError as e2:
+                self.log(f"流复制方式也失败: {e2.stderr}")
+                return False
+        finally:
+            if os.path.exists(list_file):
+                os.remove(list_file)
+
     def concatenate_videos(self, video_list, output_path):
-        """拼接视频片段"""
-        self.log("开始拼接视频片段...")
+        """拼接视频片段（使用流复制，快速但可能有问题）"""
+        self.log("开始拼接视频片段（流复制）...")
         start_time = time.time()
 
         # 创建临时文件列表
@@ -3299,7 +3627,7 @@ class APISRVideoProcessor:
             concat_time = time.time() - concat_start
 
             total_time = time.time() - start_time
-            self.log(f"视频拼接完成: {output_path}")
+            self.log(f"视频拼接完成（流复制）: {output_path}")
             self.log(f"  总耗时: {total_time:.2f}秒 (拼接: {concat_time:.2f}s)")
             return True
         except subprocess.CalledProcessError as e:
@@ -3435,6 +3763,10 @@ class APISRVideoProcessor:
 
             # 重置状态
             self.current_video_index = 0
+
+            # 执行任务结束后的行为
+            self.log("正在执行任务结束行为...")
+            self.execute_post_action()
 
         except Exception as e:
             self.log(f"批量处理失败: {str(e)}")

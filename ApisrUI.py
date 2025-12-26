@@ -167,7 +167,7 @@ class APISRVideoProcessor:
         # 跟踪测试模式变化
         self.test_mode_var.trace('w', self.on_test_mode_changed)
 
-    def on_test_mode_changed(self, *args):
+    def on_test_mode_changed(self):
         """测试模式变化时的处理"""
         current_state = self.test_mode_var.get()
 
@@ -248,7 +248,7 @@ class APISRVideoProcessor:
         # 在setup_ui中创建输入框时使用这个验证函数
         self.history_validation_command = vcmd
 
-    def adjust_history_size(self, event=None):
+    def adjust_history_size(self):
         """调整历史帧数量为最接近的10的倍数"""
         try:
             current_value = self.history_size_var.get()
@@ -752,7 +752,7 @@ class APISRVideoProcessor:
             return f"GPU: {gpu_name} ({gpu_memory:.1f}GB)"
         return "无可用GPU"
 
-    def on_model_change(self, event=None):
+    def on_model_change(self):
         """当模型改变时更新可用缩放因子"""
         model = self.model_var.get()
         if model in self.models:
@@ -1319,7 +1319,7 @@ class APISRVideoProcessor:
 
         return generator
 
-    def load_dat(self, generator_weight_PATH, scale=4):
+    def load_dat(self, generator_weight_PATH):
         '''加载DAT模型'''
         start_time = time.time()
 
@@ -1739,7 +1739,7 @@ class APISRVideoProcessor:
         if model_name == "GRL":
             generator = self.load_grl(weight_path, scale=scale)
         elif model_name == "DAT":
-            generator = self.load_dat(weight_path, scale=scale)
+            generator = self.load_dat(weight_path)
         elif model_name == "RRDB":
             generator = self.load_rrdb(weight_path, scale=scale)
         elif model_name == "CUNET":

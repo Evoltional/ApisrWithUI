@@ -9,11 +9,14 @@ import threading
 import time
 import tkinter as tk
 import warnings
+import traceback
+import GPUtil
+from torchvision.transforms import ToTensor
 from datetime import datetime
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
-
+import gc
 import cv2
 import imagehash
 import numpy as np
@@ -361,7 +364,7 @@ class APISRVideoProcessor:
                                background=self.bg_color)
         title_label.pack(side=tk.LEFT)
 
-        version_label = tk.Label(title_frame, text="v2.0",  # 版本更新到2.0
+        version_label = tk.Label(title_frame, text="v3.0",
                                  font=('Segoe UI', 9),
                                  foreground='#7f8c8d',
                                  background=self.bg_color)
@@ -679,7 +682,7 @@ class APISRVideoProcessor:
                         value="shutdown").pack(anchor=tk.W, pady=2)
 
         # 添加警告标签
-        warning_label = tk.Label(action_frame, text="注意：选中关机将自动执行，无需确认",
+        warning_label = tk.Label(action_frame,
                                  font=('Segoe UI', 8),
                                  foreground=self.warning_color,
                                  background=self.bg_color)
@@ -1033,7 +1036,6 @@ class APISRVideoProcessor:
 
             except Exception as e:
                 self.log(f"加载配置文件时出错: {e}")
-                import traceback
                 self.log(f"错误详情: {traceback.format_exc()}")
         else:
             self.log("未找到配置文件，使用默认配置")
@@ -1084,14 +1086,12 @@ class APISRVideoProcessor:
         except Exception as e:
             self.log(f"保存配置文件时出错: {e}")
             # 打印详细错误信息以帮助调试
-            import traceback
             self.log(f"错误详情: {traceback.format_exc()}")
 
     def add_memory_monitoring(self):
         """添加内存使用监控功能"""
         try:
             if torch.cuda.is_available():
-                import GPUtil
                 gpus = GPUtil.getGPUs()
                 if gpus:
                     gpu = gpus[0]
@@ -1127,7 +1127,6 @@ class APISRVideoProcessor:
                 torch.cuda.synchronize()
 
             # 清理Python内存
-            import gc
             gc.collect()
 
             # 清理OpenCV缓冲区（如果有）
@@ -1767,8 +1766,6 @@ class APISRVideoProcessor:
             # 测试模式不处理，直接返回RGB格式
             elapsed = time.time() - start_time
             return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # 返回RGB格式
-
-        from torchvision.transforms import ToTensor
 
         # 预处理阶段时间统计
         preprocess_start = time.time()
@@ -2793,6 +2790,7 @@ class APISRVideoProcessor:
 
     def update_immediate_merge(self):
         """更新立即合并视频 - 检查04_processed_segments文件夹并合并到05_immediate_merge"""
+        global list_file
         if not self.immediate_merge_var.get() or self.test_mode_var.get():
             return None
 
@@ -3012,7 +3010,6 @@ class APISRVideoProcessor:
 
         except Exception as e:
             self.log(f"立即合成失败: {e}")
-            import traceback
             self.log(f"错误详情: {traceback.format_exc()}")
             return None
         finally:
@@ -3021,6 +3018,7 @@ class APISRVideoProcessor:
 
     def process_single_video(self, video_path):
         """处理单个视频"""
+        global model_load_time, split_time
         try:
             self.log(
                 f"开始处理视频 {self.current_video_index + 1}/{len(self.input_paths)}: {os.path.basename(video_path)}")
@@ -3382,7 +3380,6 @@ class APISRVideoProcessor:
 
         except Exception as e:
             self.log(f"处理视频失败: {str(e)}")
-            import traceback
             self.log(f"错误详情:\n{traceback.format_exc()}")
             return False
 

@@ -76,7 +76,7 @@ class APISRVideoProcessor:
         self.config_file = "apisr_config.json"
 
         # 初始化变量
-        self.input_paths = []  # 改为存储多个视频路径的列表
+        self.input_paths = []  # 改为存储多个视频路径的列
         self.output_dir = tk.StringVar()
         self.model_var = tk.StringVar(value="GRL")
         self.scale_var = tk.StringVar(value="4")
@@ -84,18 +84,18 @@ class APISRVideoProcessor:
         self.downsample_threshold = tk.StringVar(value="720")
         self.float16_var = tk.BooleanVar(value=False)
         self.crop_for_4x_var = tk.BooleanVar(value=True)
-        self.hash_threshold_var = tk.StringVar(value="3")
-        self.ssim_threshold_var = tk.StringVar(value="0.98")
+        self.hash_threshold_var = tk.StringVar(value="2")
+        self.ssim_threshold_var = tk.StringVar(value="0.99")
         self.enable_dup_detect_var = tk.BooleanVar(value=True)
         self.use_ssim_var = tk.BooleanVar(value=True)
         self.use_hash_var = tk.BooleanVar(value=True)
         self.test_mode_var = tk.BooleanVar(value=False)
         self.enable_history_var = tk.BooleanVar(value=True)
-        self.history_size_var = tk.StringVar(value="20")  # 默认值改为20
-        self.immediate_merge_var = tk.BooleanVar(value=False)  # 新增：立即合成视频选项
-        self.video_encoder_mode = tk.StringVar(value="auto")  # 新增：视频编码器模式
-        self.last_test_mode_state = False  # 记录上一次的测试模式状态
-        self.post_action_var = tk.StringVar(value="none")  # 新增：任务结束行为
+        self.history_size_var = tk.StringVar(value="20")
+        self.immediate_merge_var = tk.BooleanVar(value=False)
+        self.video_encoder_mode = tk.StringVar(value="auto")
+        self.last_test_mode_state = False
+        self.post_action_var = tk.StringVar(value="none")
 
         # 设置样式
         self.setup_styles()
@@ -3905,7 +3905,7 @@ class APISRVideoProcessor:
         if self.processing:
             response = messagebox.askyesno("退出",
                                            "处理仍在进行中，是否确认退出？\n\n"
-                                           "退出后进度将不会保存，下次需要重新开始处理。")
+                                           "再次启动时系统将从临时文件中读取进度，请勿修改临时文件")
 
             if not response:
                 return
@@ -3926,6 +3926,13 @@ class APISRVideoProcessor:
 
 def main():
     """主函数"""
+    # 设置环境变量避免编码问题
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
+
     app = APISRVideoProcessor()
     app.run()
 

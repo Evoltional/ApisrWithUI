@@ -887,7 +887,8 @@ class APISRVideoProcessor:
             if os.path.exists(dir_path):
                 try:
                     shutil.rmtree(dir_path)
-                except Exception as e:
+                except OSError:
+                    # 目录可能已被删除或其他进程占用，忽略错误
                     pass
 
     def cleanup_temp_files(self):
@@ -1099,9 +1100,6 @@ class APISRVideoProcessor:
         except ImportError:
             # 如果GPUtil不可用，跳过
             pass
-        except Exception as e:
-            # 监控出错时不中断处理
-            pass
 
     def start_memory_monitor(self):
         """启动内存监控线程"""
@@ -1112,7 +1110,8 @@ class APISRVideoProcessor:
                 try:
                     if not self.paused and not self.stopped:
                         self.add_memory_monitoring()
-                except:
+                except Exception:
+                    # 内存监控出错时不中断主处理流程
                     pass
 
         self.monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
@@ -1132,7 +1131,8 @@ class APISRVideoProcessor:
             # 清理OpenCV缓冲区（如果有）
             try:
                 cv2.destroyAllWindows()
-            except:
+            except cv2.error:
+                # OpenCV可能未初始化或没有窗口，忽略错误
                 pass
 
         except Exception as e:
@@ -1174,7 +1174,7 @@ class APISRVideoProcessor:
             self.log(f"未知的任务结束行为: {action}")
 
     def load_rrdb(self, generator_weight_PATH, scale, print_options=False):
-        '''加载RRDB模型'''
+        """加载RRDB模型"""
         start_time = time.time()
 
         # 加载检查点
@@ -1223,7 +1223,7 @@ class APISRVideoProcessor:
         return generator
 
     def load_cunet(self, generator_weight_PATH, scale, print_options=False):
-        '''加载CUNET模型'''
+        """加载CUNET模型"""
         start_time = time.time()
 
         if scale != 2:
@@ -1272,7 +1272,7 @@ class APISRVideoProcessor:
         return generator
 
     def load_grl(self, generator_weight_PATH, scale=4):
-        '''加载GRL模型'''
+        """加载GRL模型"""
         start_time = time.time()
 
         # 加载检查点
@@ -1319,7 +1319,7 @@ class APISRVideoProcessor:
         return generator
 
     def load_dat(self, generator_weight_PATH):
-        '''加载DAT模型'''
+        """加载DAT模型"""
         start_time = time.time()
 
         # 加载检查点
@@ -1424,7 +1424,6 @@ class APISRVideoProcessor:
             return False, None, None, None
 
         total_start_time = time.time()
-        history_size = len(self.frame_history)
 
         current_hash = None
         current_thumbnail = None
@@ -1455,14 +1454,10 @@ class APISRVideoProcessor:
 
         # 从最近帧开始检查（时间上越接近越可能重复）
         best_match_idx = -1
-        best_match_reason = ""
-        best_hash_diff = None
-        best_ssim_value = None
         detected_hash_diff = None
         detected_ssim_value = None
 
         # 遍历历史帧（从最近的开始）
-        compare_start = time.time()
         ssim_compare_time = 0
         hash_compare_time = 0
 
@@ -1488,7 +1483,6 @@ class APISRVideoProcessor:
                 if hash_diff <= hash_threshold:
                     # 如果同时启用了SSIM检测，需要验证SSIM
                     if self.use_ssim_var.get():
-                        ssim_compare_start = time.time()
                         ssim_value, ssim_elapsed = self.calculate_ssim_fast(frame, hist_frame)
                         ssim_compare_time += ssim_elapsed
 
@@ -1497,19 +1491,13 @@ class APISRVideoProcessor:
 
                         if ssim_value >= ssim_threshold:
                             best_match_idx = i
-                            best_match_reason = f"哈希({hash_diff})和SSIM({ssim_value:.3f})匹配"
-                            best_hash_diff = hash_diff
-                            best_ssim_value = ssim_value
                             break
                     else:
                         # 只使用哈希检测
                         best_match_idx = i
-                        best_match_reason = f"哈希匹配(差异:{hash_diff})"
-                        best_hash_diff = hash_diff
                         break
             # 如果只使用SSIM检测
             elif self.use_ssim_var.get() and current_thumbnail is not None and hist_thumbnail is not None:
-                ssim_compare_start = time.time()
                 ssim_value, ssim_elapsed = self.calculate_ssim_fast(frame, hist_frame)
                 ssim_compare_time += ssim_elapsed
 
@@ -1518,11 +1506,8 @@ class APISRVideoProcessor:
 
                 if ssim_value >= ssim_threshold:
                     best_match_idx = i
-                    best_match_reason = f"SSIM匹配({ssim_value:.3f})"
-                    best_ssim_value = ssim_value
                     break
 
-        compare_time = time.time() - compare_start
         total_elapsed = time.time() - total_start_time
 
         # 构建检测值字符串
@@ -1764,7 +1749,6 @@ class APISRVideoProcessor:
 
         if self.test_mode_var.get():
             # 测试模式不处理，直接返回RGB格式
-            elapsed = time.time() - start_time
             return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # 返回RGB格式
 
         # 预处理阶段时间统计
@@ -1788,7 +1772,6 @@ class APISRVideoProcessor:
             frame_rgb = cv2.resize(frame_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             # 立即清理中间变量
             del frame
-            frame = None
 
         # 裁剪（如果需要）
         if self.crop_for_4x_var.get() and scale == 4:
@@ -1808,7 +1791,6 @@ class APISRVideoProcessor:
 
         # 立即清理不再需要的变量
         del frame_rgb
-        frame_rgb = None
 
         if torch.cuda.is_available():
             img_tensor = img_tensor.cuda()
@@ -1861,7 +1843,6 @@ class APISRVideoProcessor:
     def process_frame_with_enhanced_dup_detect(self, frame, frame_idx):
         """处理单帧，包含增强的重复帧检测 - 修复内存泄漏版本"""
         start_time = time.time()
-        is_duplicate = False
 
         try:
             # 检查是否为重复帧
@@ -1887,7 +1868,6 @@ class APISRVideoProcessor:
                 # 添加帧到历史记录
                 self.add_frame_to_history(frame, current_hash, current_thumbnail, result_np, frame_idx)
 
-                total_elapsed = time.time() - start_time
                 return result_np, current_hash, current_thumbnail, is_duplicate
 
             # 非重复帧，进行超分辨率处理
@@ -1897,13 +1877,10 @@ class APISRVideoProcessor:
 
             # 计算当前帧的信息
             if self.use_hash_var.get():
-                hash_start = time.time()
                 if current_hash is None:
-                    current_hash, hash_time = self.calculate_frame_hash(frame)
-                else:
-                    hash_time = time.time() - hash_start
+                    current_hash, _ = self.calculate_frame_hash(frame)
             else:
-                hash_time = 0
+                current_hash = current_hash if current_hash is not None else None
 
             if self.use_ssim_var.get() and current_thumbnail is None:
                 h, w = frame.shape[:2]
@@ -1951,7 +1928,8 @@ class APISRVideoProcessor:
                     try:
                         segment_num = int(f.split('_')[2].split('.')[0])
                         processed_segments.append(segment_num)
-                    except:
+                    except (ValueError, IndexError):
+                        # 文件名格式不符合预期，跳过该文件
                         pass
 
         # 2. 从03_segment_frames文件夹获取当前处理的片段和帧
@@ -1982,7 +1960,8 @@ class APISRVideoProcessor:
                     if current_segment_name.startswith("segment_"):
                         try:
                             current_segment = int(current_segment_name.split('_')[1])
-                        except:
+                        except (ValueError, IndexError):
+                            # 无法解析片段编号，使用默认值0
                             current_segment = 0
                 except:
                     current_segment = 0
@@ -1997,7 +1976,8 @@ class APISRVideoProcessor:
                         last_frame = frame_files[-1]
                         try:
                             current_frame = int(last_frame.split('_')[1].split('.')[0]) + 1
-                        except:
+                        except (ValueError, IndexError):
+                            # 无法解析帧号，使用默认值0
                             current_frame = 0
 
         # 3. 确定下一个要处理的片段
@@ -2020,10 +2000,10 @@ class APISRVideoProcessor:
         self.log(f"处理片段 {segment_index}: {segment_name}")
         segment_start_time = time.time()
 
+        # 测试模式继续执行，不提前返回
         if self.test_mode_var.get():
             self.log("测试模式：仅进行重复帧检测，不进行超分辨率处理")
-            # 测试模式不生成视频，但会保留帧文件供检查
-            return None, None
+            # 注意：测试模式仍然会执行下面的帧处理循环，但process_single_frame返回原始帧
 
         # 初始化历史帧缓存
         self.init_history_cache()
@@ -2122,7 +2102,8 @@ class APISRVideoProcessor:
                     try:
                         frame_num = int(f.split('_')[1].split('.')[0])
                         existing_frames.append(frame_num)
-                    except:
+                    except (ValueError, IndexError):
+                        # 文件名格式不符合预期，跳过该文件
                         pass
 
             if existing_frames:
@@ -2334,7 +2315,7 @@ class APISRVideoProcessor:
         encoder_mode = self.video_encoder_mode.get()
 
         if encoder_mode == "ffmpeg" or (encoder_mode == "auto" and not self.check_opencv_encoder_support()):
-            return self.frames_to_video_alternative(frame_files, output_path, fps, width, height, audio_path)
+            return self.frames_to_video_alternative(frame_files, output_path, fps, audio_path)
         else:
             return self.frames_to_video_opencv(frame_files, output_path, fps, width, height, audio_path)
 
@@ -2361,7 +2342,6 @@ class APISRVideoProcessor:
         ]
 
         out = None
-        selected_encoder = None
         selected_ext = None
 
         # 尝试不同的编码器
@@ -2376,20 +2356,19 @@ class APISRVideoProcessor:
                 out = cv2.VideoWriter(temp_video_path, fourcc, fps, (width, height))
 
                 if out.isOpened():
-                    selected_encoder = codec
                     selected_ext = ext
                     self.log(f"使用编码器: {codec}，文件格式: {ext}")
                     break
                 else:
                     out.release()
-            except Exception as e:
+            except Exception:
                 if out:
                     out.release()
                 continue
 
         if not out or not out.isOpened():
             self.log("错误: 无法创建视频写入器，尝试使用ffmpeg方式")
-            return self.frames_to_video_alternative(frame_files, output_path, fps, width, height, audio_path)
+            return self.frames_to_video_alternative(frame_files, output_path, fps, audio_path)
 
         # 按顺序写入所有帧
         write_start = time.time()
@@ -2432,7 +2411,7 @@ class APISRVideoProcessor:
         # 确保视频文件创建成功
         if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
             self.log(f"错误: 视频文件创建失败: {temp_video_path}")
-            return self.frames_to_video_alternative(frame_files, output_path, fps, width, height, audio_path)
+            return self.frames_to_video_alternative(frame_files, output_path, fps, audio_path)
 
         file_size = os.path.getsize(temp_video_path) / (1024 * 1024)  # 转换为MB
         self.log(f"临时视频创建成功，大小: {file_size:.2f} MB，写入耗时: {write_total_time:.2f}秒")
@@ -2478,7 +2457,7 @@ class APISRVideoProcessor:
                     output_path
                 ]
 
-                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
 
                 # 删除临时文件
                 if os.path.exists(temp_video_path):
@@ -2561,7 +2540,7 @@ class APISRVideoProcessor:
 
         return False
 
-    def frames_to_video_alternative(self, frame_files, output_path, fps, width, height, audio_path=None):
+    def frames_to_video_alternative(self, frame_files, output_path, fps, audio_path=None):
         """替代方法：使用ffmpeg直接生成视频（避免OpenCV编码器问题）"""
         self.log("使用ffmpeg直接生成视频...")
         start_time = time.time()
@@ -2710,7 +2689,6 @@ class APISRVideoProcessor:
             video.close()
             return None, None
 
-        frame_idx = 0
         frames_processed = 0
         total_frame_time = 0
 
@@ -2746,9 +2724,7 @@ class APISRVideoProcessor:
             frame_process_time = time.time() - process_start
             total_frame_time += frame_process_time
 
-            # 写入帧（注意：moviepy需要RGB格式）
-            sr_frame_rgb = cv2.cvtColor(sr_frame, cv2.COLOR_BGR2RGB)
-            writer.write_frame(sr_frame_rgb)
+            writer.write_frame(sr_frame)
 
             # 更新进度
             frames_processed += 1
@@ -2790,7 +2766,6 @@ class APISRVideoProcessor:
 
     def update_immediate_merge(self):
         """更新立即合并视频 - 检查04_processed_segments文件夹并合并到05_immediate_merge"""
-        global list_file
         if not self.immediate_merge_var.get() or self.test_mode_var.get():
             return None
 
@@ -3018,7 +2993,7 @@ class APISRVideoProcessor:
 
     def process_single_video(self, video_path):
         """处理单个视频"""
-        global model_load_time, split_time
+
         try:
             self.log(
                 f"开始处理视频 {self.current_video_index + 1}/{len(self.input_paths)}: {os.path.basename(video_path)}")
@@ -3210,70 +3185,51 @@ class APISRVideoProcessor:
                 self.log(f"处理已停止")
                 return False
 
-            # 步骤4: 如果处理了多个片段且不是测试模式，拼接视频
-            if not self.test_mode_var.get():
-                # 检查是否有立即合成的最终视频
-                merge_dir = os.path.join(self.temp_base_dir, "05_immediate_merge")
-                if self.immediate_merge_var.get() and os.path.exists(merge_dir):
-                    # 查找最新的合并视频
-                    merged_files = []
-                    for f in os.listdir(merge_dir):
-                        if f.startswith("merged_video_") and f.endswith(".mp4"):
-                            merged_files.append(os.path.join(merge_dir, f))
+            # 步骤4: 拼接视频片段（测试模式也拼接，生成测试视频）
+            self.log("=" * 60)
+            self.log("步骤4: 拼接处理后的视频片段...")
 
-                    if merged_files:
-                        # 按文件名排序（包含时间戳）
-                        merged_files.sort(key=lambda x: os.path.basename(x))
-                        latest_merged = merged_files[-1]
+            if self.test_mode_var.get():
+                output_filename = f"{self.video_base_name}_test.mp4"
+                self.log("测试模式：将生成测试视频（使用原始帧）")
+            else:
+                output_filename = f"{self.video_base_name}_super_resolved.mp4"
 
-                        # 将最终合并视频移动到输出目录
-                        output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                        final_output = os.path.join(self.output_dir.get(), output_filename)
+            # 检查是否有立即合成的视频
+            merge_dir = os.path.join(self.temp_base_dir, "05_immediate_merge")
+            if self.immediate_merge_var.get() and os.path.exists(merge_dir):
+                # 查找最新的合并视频
+                merged_files = []
+                for f in os.listdir(merge_dir):
+                    if f.startswith("merged_video_") and f.endswith(".mp4"):
+                        merged_files.append(os.path.join(merge_dir, f))
 
-                        merge_start = time.time()
-                        # 确保视频重新编码以确保兼容性
-                        if self.concatenate_videos_reencode([latest_merged], final_output):
-                            merge_time = time.time() - merge_start
+                if merged_files:
+                    # 按文件名排序（包含时间戳）
+                    merged_files.sort(key=lambda x: os.path.basename(x))
+                    latest_merged = merged_files[-1]
 
-                            self.update_progress(95)
-                            self.log(f"使用立即合成的视频作为最终输出: {final_output}，编码耗时: {merge_time:.2f}秒")
+                    # 将最终合并视频移动到输出目录
+                    final_output = os.path.join(self.output_dir.get(), output_filename)
 
-                            # 清理立即合成目录
-                            shutil.rmtree(merge_dir)
-                            self.log("已清理立即合成目录")
-                        else:
-                            # 如果重新编码失败，使用简单复制
-                            shutil.copy2(latest_merged, final_output)
-                            self.log(f"使用立即合成的视频作为最终输出（简单复制）: {final_output}")
+                    merge_start = time.time()
+                    # 确保视频重新编码以确保兼容性
+                    if self.concatenate_videos_reencode([latest_merged], final_output):
+                        merge_time = time.time() - merge_start
+
+                        self.update_progress(95)
+                        self.log(f"使用立即合成的视频作为最终输出: {final_output}，编码耗时: {merge_time:.2f}秒")
+
+                        # 清理立即合成目录
+                        shutil.rmtree(merge_dir)
+                        self.log("已清理立即合成目录")
                     else:
-                        # 如果没有立即合成视频，则使用传统拼接方式
-                        self.log("=" * 60)
-                        self.log("步骤4: 拼接处理后的视频片段...")
-
-                        if all_processed_segments:
-                            output_filename = f"{self.video_base_name}_super_resolved.mp4"
-                            final_output = os.path.join(self.output_dir.get(), output_filename)
-
-                            if len(all_processed_segments) > 1:
-                                self.concatenate_videos_reencode(all_processed_segments, final_output)
-                            else:
-                                # 如果只有一个片段，直接复制
-                                copy_start = time.time()
-                                shutil.copy2(all_processed_segments[0], final_output)
-                                copy_time = time.time() - copy_start
-                                self.log(f"复制单个片段，耗时: {copy_time:.2f}秒")
-
-                            self.update_progress(95)
-                            self.log(f"最终输出文件: {final_output}")
-                        else:
-                            self.log("没有可拼接的片段")
+                        # 如果重新编码失败，使用简单复制
+                        shutil.copy2(latest_merged, final_output)
+                        self.log(f"使用立即合成的视频作为最终输出（简单复制）: {final_output}")
                 else:
-                    # 传统拼接方式
-                    self.log("=" * 60)
-                    self.log("步骤4: 拼接处理后的视频片段...")
-
+                    # 如果没有立即合成视频，则使用传统拼接方式
                     if all_processed_segments:
-                        output_filename = f"{self.video_base_name}_super_resolved.mp4"
                         final_output = os.path.join(self.output_dir.get(), output_filename)
 
                         if len(all_processed_segments) > 1:
@@ -3290,9 +3246,23 @@ class APISRVideoProcessor:
                     else:
                         self.log("没有可拼接的片段")
             else:
-                # 测试模式：不生成视频
-                self.log("测试模式：跳过视频合成步骤")
-                self.update_progress(95)
+                # 传统拼接方式
+                if all_processed_segments:
+                    final_output = os.path.join(self.output_dir.get(), output_filename)
+
+                    if len(all_processed_segments) > 1:
+                        self.concatenate_videos_reencode(all_processed_segments, final_output)
+                    else:
+                        # 如果只有一个片段，直接复制
+                        copy_start = time.time()
+                        shutil.copy2(all_processed_segments[0], final_output)
+                        copy_time = time.time() - copy_start
+                        self.log(f"复制单个片段，耗时: {copy_time:.2f}秒")
+
+                    self.update_progress(95)
+                    self.log(f"最终输出文件: {final_output}")
+                else:
+                    self.log("没有可拼接的片段")
 
             # 步骤5: 自动清理临时文件
             self.log("=" * 60)
@@ -3302,7 +3272,6 @@ class APISRVideoProcessor:
             # 在视频处理完成后，自动清理所有临时文件，只保留处理好的视频
             if not self.test_mode_var.get():
                 # 检查是否成功生成了最终视频
-                output_filename = f"{self.video_base_name}_super_resolved.mp4"
                 final_output = os.path.join(self.output_dir.get(), output_filename)
 
                 if os.path.exists(final_output):
@@ -3361,8 +3330,9 @@ class APISRVideoProcessor:
 
             if self.test_mode_var.get():
                 self.log(f"测试模式完成！测试结果保存在: {temp_dirs['base']}")
+                self.log(f"测试视频已生成: {output_filename}")
             else:
-                self.log(f"处理完成！输出文件: {self.video_base_name}_super_resolved.mp4")
+                self.log(f"处理完成！输出文件: {output_filename}")
 
             # 重置状态
             self.current_segment_index = 0

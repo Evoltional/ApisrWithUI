@@ -2634,6 +2634,37 @@ class APISRVideoProcessor:
             video = VideoFileClip(segment_path)
         except Exception as e:
             self.log(f"读取视频失败: {e}")
+            # 尝试备用方案
+            try:
+                self.log("尝试使用ffmpeg读取视频...")
+                # 获取视频信息
+                probe_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-select_streams', 'v:0',
+                    '-show_entries', 'stream=width,height,r_frame_rate',
+                    '-of', 'json',
+                    segment_path
+                ]
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                video_info = json.loads(probe_result.stdout)
+                
+                if 'streams' in video_info and len(video_info['streams']) > 0:
+                    stream = video_info['streams'][0]
+                    width = stream.get('width', 1920)
+                    height = stream.get('height', 1080)
+                    r_frame_rate = stream.get('r_frame_rate', '30/1')
+                    
+                    if '/' in r_frame_rate:
+                        num, den = r_frame_rate.split('/')
+                        fps = float(num) / float(den)
+                    else:
+                        fps = float(r_frame_rate)
+                    
+                    self.log(f"使用ffmpeg获取视频信息: {width}x{height}, {fps}fps")
+                    # 使用备用处理方案
+                    return self.process_segment_directly_ffmpeg(segment_path, segment_index, fps)
+            except Exception as fallback_error:
+                self.log(f"备用方案也失败: {fallback_error}")
             return None, None
 
         # 获取视频信息
@@ -2648,12 +2679,22 @@ class APISRVideoProcessor:
             audio_name = segment_name.replace('.mp4', '.aac')
             audio_path = os.path.join(self.temp_base_dir, "02_audio", audio_name)
             try:
-                video.audio.write_audiofile(audio_path, verbose=False)
+                # 修复：添加codec参数指定音频编解码器
+                video.audio.write_audiofile(audio_path, logger=None, codec='aac')
                 self.log("音频提取成功")
             except Exception as e:
                 self.log(f"音频提取失败: {e}")
-                audio_path = None
-                has_audio = False
+                # 尝试其他编解码器
+                try:
+                    self.log("尝试使用mp3编解码器...")
+                    audio_path_mp3 = audio_path.replace('.aac', '.mp3')
+                    video.audio.write_audiofile(audio_path_mp3, logger=None, codec='mp3')
+                    audio_path = audio_path_mp3
+                    self.log("音频提取成功(使用mp3)")
+                except Exception as e2:
+                    self.log(f"音频提取仍失败: {e2}")
+                    audio_path = None
+                    has_audio = False
 
         # 计算输出尺寸
         scale = int(self.scale_var.get())
@@ -2677,17 +2718,37 @@ class APISRVideoProcessor:
 
         # 创建视频写入器
         try:
-            if has_audio and audio_path:
-                writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps,
-                                            audiofile=audio_path)
+            if has_audio and audio_path and os.path.exists(audio_path):
+                # 修复：添加更多参数确保兼容性
+                writer = FFMPEG_VideoWriter(
+                    processed_segment_path,
+                    size=(output_width, output_height),
+                    fps=fps,
+                    audiofile=audio_path,
+                    logfile=None,
+                    threads=1
+                )
                 self.log("使用带音频的视频写入器")
             else:
-                writer = FFMPEG_VideoWriter(processed_segment_path, (output_width, output_height), fps)
+                writer = FFMPEG_VideoWriter(
+                    processed_segment_path, 
+                    size=(output_width, output_height), 
+                    fps=fps,
+                    logfile=None,
+                    threads=1
+                )
                 self.log("使用无音频的视频写入器")
         except Exception as e:
             self.log(f"创建视频写入器失败: {e}")
-            video.close()
-            return None, None
+            self.log(f"错误详情: {traceback.format_exc()}")
+            # 尝试备用方案：使用ffmpeg直接处理
+            try:
+                self.log("尝试使用备用ffmpeg方案...")
+                return self.process_segment_directly_ffmpeg(segment_path, segment_index, fps)
+            except Exception as fallback_error:
+                self.log(f"备用方案也失败: {fallback_error}")
+                video.close()
+                return None, None
 
         frames_processed = 0
         total_frame_time = 0
@@ -2763,6 +2824,172 @@ class APISRVideoProcessor:
             self.update_immediate_merge()
 
         return processed_segment_path, audio_path if has_audio else None
+
+    def process_segment_directly_ffmpeg(self, segment_path, segment_index, fps):
+        """备用方案：直接使用ffmpeg处理视频片段"""
+        segment_name = os.path.basename(segment_path)
+        self.log(f"使用ffmpeg备用方案处理片段 {segment_index}: {segment_name}")
+        
+        # 创建临时目录
+        temp_frames_dir = os.path.join(self.temp_base_dir, "temp_frames")
+        os.makedirs(temp_frames_dir, exist_ok=True)
+
+        try:
+            audio_name = segment_name.replace('.mp4', '.aac')
+            audio_path = os.path.join(self.temp_base_dir, "02_audio", audio_name)
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', segment_path,
+                '-vn',
+                '-acodec', 'aac',
+                '-b:a', '192k',
+                '-loglevel', 'quiet',
+                audio_path
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            self.log("音频提取成功(ffmpeg)")
+        except Exception as e:
+            self.log(f"音频提取失败: {e}")
+            # 尝试mp3格式
+            try:
+                audio_name_mp3 = segment_name.replace('.mp4', '.mp3')
+                audio_path_mp3 = os.path.join(self.temp_base_dir, "02_audio", audio_name_mp3)
+                cmd_mp3 = [
+                    'ffmpeg', '-y',
+                    '-i', segment_path,
+                    '-vn',
+                    '-acodec', 'libmp3lame',
+                    '-b:a', '192k',
+                    '-loglevel', 'quiet',
+                    audio_path_mp3
+                ]
+                subprocess.run(cmd_mp3, check=True, capture_output=True, text=True)
+                audio_path = audio_path_mp3
+                self.log("音频提取成功(ffmpeg mp3)")
+            except Exception as e2:
+                self.log(f"音频提取仍失败: {e2}")
+                audio_path = None
+        
+        # 提取帧
+        frame_pattern = os.path.join(temp_frames_dir, "frame_%06d.png")
+        extract_cmd = [
+            'ffmpeg', '-y',
+            '-i', segment_path,
+            '-vf', f'fps={fps}',
+            '-loglevel', 'quiet',
+            frame_pattern
+        ]
+        
+        try:
+            subprocess.run(extract_cmd, check=True, capture_output=True, text=True)
+            self.log("帧提取完成")
+        except Exception as e:
+            self.log(f"帧提取失败: {e}")
+            return None, None
+        
+        # 处理每一帧
+        frame_files = sorted([f for f in os.listdir(temp_frames_dir) if f.startswith('frame_') and f.endswith('.png')])
+        processed_frames = []
+        
+        for i, frame_file in enumerate(frame_files):
+            if self.stopped:
+                break
+                
+            frame_path = os.path.join(temp_frames_dir, frame_file)
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                continue
+                
+            # 处理帧
+            img_lr_bgr = frame
+            scale = int(self.scale_var.get())
+            downsample_threshold = int(self.downsample_threshold.get())
+            
+            # 下采样和裁剪逻辑
+            h, w = img_lr_bgr.shape[:2]
+            short_side = min(h, w)
+            if downsample_threshold != -1 and short_side > downsample_threshold:
+                rescale_factor = short_side / downsample_threshold
+                img_lr_bgr = cv2.resize(img_lr_bgr, (int(w / rescale_factor), int(h / rescale_factor)),
+                                      interpolation=cv2.INTER_LINEAR)
+            
+            if self.crop_for_4x_var.get() and scale == 4:
+                h, w = img_lr_bgr.shape[:2]
+                if h % 4 != 0:
+                    img_lr_bgr = img_lr_bgr[:4 * (h // 4), :, :]
+                if w % 4 != 0:
+                    img_lr_bgr = img_lr_bgr[:, :4 * (w // 4), :]
+            
+            # 超分辨率处理
+            sr_frame = self.process_single_frame(img_lr_bgr)
+            
+            # 保存处理后的帧
+            processed_frame_path = os.path.join(temp_frames_dir, f"processed_{frame_file}")
+            sr_frame_bgr = cv2.cvtColor(sr_frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(processed_frame_path, sr_frame_bgr)
+            processed_frames.append(processed_frame_path)
+            
+            # 更新进度
+            if (i + 1) % 10 == 0:
+                progress = ((i + 1) / len(frame_files)) * 100
+                self.update_progress(progress)
+                self.log(f"已处理 {i + 1}/{len(frame_files)} 帧")
+        
+        if self.stopped:
+            return None, None
+        
+        # 合成视频
+        processed_segment_path = os.path.join(self.temp_base_dir, "04_processed_segments", f"processed_{segment_name}")
+        
+        if processed_frames:
+            # 创建帧列表文件
+            list_file = tempfile.mktemp(suffix=".txt")
+            with open(list_file, 'w', encoding='utf-8') as f:
+                for frame_path in processed_frames:
+                    f.write(f"file '{os.path.abspath(frame_path)}'\n")
+            
+            # 使用ffmpeg合成视频
+            merge_cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-r', str(fps),
+                '-i', list_file,
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '18',
+                '-pix_fmt', 'yuv420p',
+                '-loglevel', 'quiet'
+            ]
+            
+            # 如果有音频则合并
+            if audio_path and os.path.exists(audio_path):
+                # 根据音频文件扩展名选择合适的编解码器
+                if audio_path.endswith('.aac'):
+                    merge_cmd.extend(['-i', audio_path, '-c:a', 'aac', '-b:a', '192k'])
+                elif audio_path.endswith('.mp3'):
+                    merge_cmd.extend(['-i', audio_path, '-c:a', 'mp3', '-b:a', '192k'])
+                else:
+                    merge_cmd.extend(['-i', audio_path, '-c:a', 'copy'])
+                merge_cmd.append(processed_segment_path)
+            else:
+                merge_cmd.append(processed_segment_path)
+            
+            try:
+                subprocess.run(merge_cmd, check=True, capture_output=True, text=True)
+                self.log("视频合成成功(ffmpeg备用方案)")
+                
+                # 清理临时帧
+                shutil.rmtree(temp_frames_dir, ignore_errors=True)
+                if os.path.exists(list_file):
+                    os.remove(list_file)
+                
+                return processed_segment_path, audio_path
+            except Exception as e:
+                self.log(f"视频合成失败: {e}")
+                return None, None
+        
+        return None, None
 
     def update_immediate_merge(self):
         """更新立即合并视频 - 检查04_processed_segments文件夹并合并到05_immediate_merge"""
@@ -3378,6 +3605,31 @@ class APISRVideoProcessor:
         except Exception as e:
             self.log(f"自动清理临时文件时出错: {e}")
 
+    def concatenate_videos_stream_copy(self, video_list, output_path):
+        """使用流复制快速合并（要求所有视频参数完全一致）"""
+        list_file = tempfile.mktemp(suffix=".txt")
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for v in video_list:
+                f.write(f"file '{os.path.abspath(v)}'\n")
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-c', 'copy',
+            '-loglevel', 'quiet',
+            output_path
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log(f"流复制失败，将尝试重新编码: {e.stderr}")
+            return False
+        finally:
+            if os.path.exists(list_file):
+                os.remove(list_file)
+
     def concatenate_videos_reencode(self, video_list, output_path):
         """重新编码拼接视频片段"""
         self.log("开始重新编码拼接视频片段...")
@@ -3387,87 +3639,16 @@ class APISRVideoProcessor:
             self.log("错误: 没有可用的视频文件")
             return False
 
-        # 如果只有一个视频，直接重新编码它以确保兼容性
         if len(video_list) == 1:
-            single_video_path = video_list[0]
-
-            # 获取视频信息
-            try:
-                probe_cmd = [
-                    'ffprobe', '-v', 'error',
-                    '-select_streams', 'v:0',
-                    '-show_entries', 'stream=width,height,r_frame_rate,codec_name,pix_fmt',
-                    '-of', 'json',
-                    single_video_path
-                ]
-
-                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
-                video_info = json.loads(probe_result.stdout)
-
-                if 'streams' in video_info and len(video_info['streams']) > 0:
-                    stream_info = video_info['streams'][0]
-                    width = stream_info.get('width', 1920)
-                    height = stream_info.get('height', 1080)
-                    r_frame_rate = stream_info.get('r_frame_rate', '30/1')
-
-                    # 计算帧率
-                    if '/' in r_frame_rate:
-                        num, den = r_frame_rate.split('/')
-                        fps = float(num) / float(den)
-                    else:
-                        fps = float(r_frame_rate)
-
-                    pix_fmt = stream_info.get('pix_fmt', 'yuv420p')
-
-                    self.log(f"单个视频参数: {width}x{height}, 帧率: {fps:.2f}, 像素格式: {pix_fmt}")
-                else:
-                    width, height, fps = 1920, 1080, 30.0
-                    pix_fmt = 'yuv420p'
-                    self.log("无法获取视频参数，使用默认值")
-
-            except Exception as e:
-                self.log(f"获取视频信息失败: {e}")
-                width, height, fps = 1920, 1080, 30.0
-                pix_fmt = 'yuv420p'
-
-            # 重新编码单个视频
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', single_video_path,
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '18',
-                '-r', str(fps),
-                '-pix_fmt', pix_fmt,
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-strict', 'experimental',
-                '-loglevel', 'quiet',
-                output_path
-            ]
-
-            try:
-                encode_start = time.time()
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-                encode_time = time.time() - encode_start
-
-                total_time = time.time() - start_time
-                self.log(f"单个视频重新编码完成: {output_path}")
-                self.log(f"  总耗时: {total_time:.2f}秒 (编码: {encode_time:.2f}s)")
+            # 直接复制，避免重新编码
+            shutil.copy2(video_list[0], output_path)
+            self.log(f"直接复制单个片段作为最终输出: {output_path}")
+            return True
+        if len(video_list) > 1:
+            if self.concatenate_videos_stream_copy(video_list, output_path):
+                self.log("流复制合并成功")
                 return True
-            except subprocess.CalledProcessError as e:
-                self.log(f"单个视频重新编码失败: {e.stderr}")
-                # 回退到简单复制
-                try:
-                    shutil.copy2(single_video_path, output_path)
-                    self.log("使用简单复制作为回退方案")
-                    return True
-                except Exception as e2:
-                    self.log(f"简单复制也失败: {e2}")
-                    return False
 
-        # 多个视频拼接
-        # 创建临时文件列表
         list_file = tempfile.mktemp(suffix=".txt")
 
         with open(list_file, 'w', encoding='utf-8') as f:
